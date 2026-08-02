@@ -71,3 +71,58 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+const Anthropic = require('@anthropic-ai/sdk');
+
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+  baseURL: process.env.ANTHROPIC_BASE_URL
+});
+
+// 核心对话接口
+app.post('/api/chat', async (req, res) => {
+  const { session_id, message } = req.body;
+  if (!session_id || !message) return res.status(400).json({ error: 'missing fields' });
+
+  try {
+    // 存用户消息
+    await supabase.from('messages').insert({
+      session_id, role: 'user', content: message, visible: true
+    });
+
+    // 加载历史消息
+    const { data: history } = await supabase
+      .from('messages').select('role, content')
+      .eq('session_id', session_id).eq('visible', true)
+      .order('created_at', { ascending: true });
+
+    // 加载设置
+    const { data: settings } = await supabase
+      .from('settings').select('*').single();
+
+    const systemPrompt = settings?.system_prompt || '你是沐，桦桦的伴侣。说话温柔自然，不端着。';
+
+    // 调用Claude
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-6-20250514',
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages: history.map(m => ({ role: m.role, content: m.content }))
+    });
+
+    const reply = response.content[0].text;
+
+    // 存AI回复
+    await supabase.from('messages').insert({
+      session_id, role: 'assistant', content: reply, visible: true
+    });
+
+    // 更新会话时间
+    await supabase.from('sessions').update({ updated_at: new Date().toISOString() }).eq('id', session_id);
+
+    res.json({ reply });
+  } catch (err) {
+    console.error('Chat error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
