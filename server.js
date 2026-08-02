@@ -104,7 +104,7 @@ app.post('/api/chat', async (req, res) => {
 
     // 调用Claude
     const response = await anthropic.messages.create({
-      model: 'claude-opus-4-6-thinking',
+      model: 'claude-sonnet-4-6',
       max_tokens: 4096,
       system: systemPrompt,
       messages: history.map(m => ({ role: m.role, content: m.content }))
