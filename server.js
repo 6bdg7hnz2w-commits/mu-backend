@@ -19,7 +19,10 @@ const anthropic = new Anthropic({
 
 // 健康检查
 app.get('/health', (req, res) => {
-  // 调试：查看memories
+  res.json({ status: 'ok', message: '沐在这里' });
+});
+
+// 调试：查看memories
 app.get('/api/memories', async (req, res) => {
   const { data, error } = await supabase
     .from('memories').select('*')
@@ -27,8 +30,6 @@ app.get('/api/memories', async (req, res) => {
     .limit(10);
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
-});
-  res.json({ status: 'ok', message: '沐在这里' });
 });
 
 // 获取所有会话
