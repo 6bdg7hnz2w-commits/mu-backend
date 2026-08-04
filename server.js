@@ -1,4 +1,3 @@
-```javascript
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
@@ -215,4 +214,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('Server running on port ' + PORT);
 });
-```
