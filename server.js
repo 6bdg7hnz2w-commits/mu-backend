@@ -113,8 +113,8 @@ async function callClaude(model, systemPrompt, messages, maxTokens) {
 }
 
 async function compressMemory(sessionId, messages, settings) {
-  const threshold = settings.compress_threshold || 4000;
-  const keepRounds = settings.compress_keep_rounds || 10;
+  const threshold = settings.compress_threshold || 12000;
+  const keepRounds = settings.compress_keep_rounds || 15;
 
   let totalTokens = 0;
   for (const m of messages) {
