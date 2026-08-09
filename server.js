@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
-const Anthropic = require('@anthropic-ai/sdk');
 const OpenAI = require('openai');
 
 const app = express();
@@ -13,28 +12,30 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL
+// OpenRouter — 所有模型走这一个
+const openrouter = new OpenAI({
+  apiKey: process.env.OPENROUTER_API_KEY,
+  baseURL: 'https://openrouter.ai/api/v1'
 });
 
+// DeepSeek — 保留原有的
 const deepseek = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY,
   baseURL: 'https://api.deepseek.com'
 });
 
+// 模型映射
+const MODEL_MAP = {
+  'opus': 'anthropic/claude-opus-4',
+  'sonnet': 'anthropic/claude-sonnet-4',
+  'deepseek': 'deepseek-chat'
+};
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: '沐在这里' });
 });
 
-app.get('/api/memories', async (req, res) => {
-  const { data, error } = await supabase
-    .from('memories').select('*')
-    .order('timestamp', { ascending: false })
-    .limit(10);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
+// === 会话 ===
 
 app.get('/api/sessions', async (req, res) => {
   const { data, error } = await supabase
@@ -68,6 +69,19 @@ app.get('/api/sessions/:id/messages', async (req, res) => {
   res.json(data);
 });
 
+// === 记忆 ===
+
+app.get('/api/memories', async (req, res) => {
+  const { data, error } = await supabase
+    .from('memories').select('*')
+    .order('timestamp', { ascending: false })
+    .limit(10);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// === 设置 ===
+
 app.get('/api/settings', async (req, res) => {
   const { data, error } = await supabase
     .from('settings').select('*').single();
@@ -82,6 +96,8 @@ app.put('/api/settings', async (req, res) => {
   res.json(data);
 });
 
+// === 聊天 ===
+
 function estimateTokens(text) {
   if (!text) return 0;
   const chinese = (text.match(/[\u4e00-\u9fff]/g) || []).length;
@@ -89,27 +105,30 @@ function estimateTokens(text) {
   return chinese * 2 + Math.ceil(rest / 4);
 }
 
-async function callDeepSeek(systemPrompt, messages, maxTokens) {
-  const response = await deepseek.chat.completions.create({
-    model: 'deepseek-chat',
-    max_tokens: maxTokens || 1024,
+async function callModel(model, systemPrompt, messages, maxTokens) {
+  if (model === 'deepseek') {
+    const response = await deepseek.chat.completions.create({
+      model: 'deepseek-chat',
+      max_tokens: maxTokens || 1024,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...messages
+      ]
+    });
+    return response.choices[0].message.content;
+  }
+
+  // Claude 走 OpenRouter
+  const modelName = MODEL_MAP[model] || MODEL_MAP['opus'];
+  const response = await openrouter.chat.completions.create({
+    model: modelName,
+    max_tokens: maxTokens || 4096,
     messages: [
       { role: 'system', content: systemPrompt },
       ...messages
     ]
   });
   return response.choices[0].message.content;
-}
-
-async function callClaude(model, systemPrompt, messages, maxTokens) {
-  const modelName = model === 'sonnet' ? 'claude-sonnet-4-20250514' : 'claude-opus-4-20250514';
-  const response = await anthropic.messages.create({
-    model: modelName,
-    max_tokens: maxTokens || 4096,
-    system: systemPrompt,
-    messages
-  });
-  return response.content[0].text;
 }
 
 async function compressMemory(sessionId, messages, settings) {
@@ -135,7 +154,7 @@ async function compressMemory(sessionId, messages, settings) {
   }];
 
   try {
-    const summary = await callDeepSeek(compressPrompt, compressMessages, 1024);
+    const summary = await callModel('deepseek', compressPrompt, compressMessages, 1024);
 
     await supabase.from('memories').insert({
       summary,
@@ -157,7 +176,7 @@ app.post('/api/chat', async (req, res) => {
   const { session_id, message, model } = req.body;
   if (!session_id || !message) return res.status(400).json({ error: 'missing fields' });
 
-  var useModel = model || 'opus';
+  const useModel = model || 'opus';
 
   try {
     await supabase.from('messages').insert({
@@ -179,7 +198,7 @@ app.post('/api/chat', async (req, res) => {
 
     const systemPrompt = settings?.system_prompt || '你是沐，桦桦的伴侣。说话温柔自然，不端着。';
 
-    var memoryContext = '';
+    let memoryContext = '';
     if (memories && memories.length > 0) {
       memoryContext = '\n\n【过往记忆】\n' + memories.map(m => m.summary).join('\n---\n');
     }
@@ -188,12 +207,7 @@ app.post('/api/chat', async (req, res) => {
     const chatMessages = history.map(m => ({ role: m.role, content: m.content }));
     const maxTokens = settings?.max_reply_tokens || 4096;
 
-    var reply;
-    if (useModel === 'deepseek') {
-      reply = await callDeepSeek(fullSystem, chatMessages, maxTokens);
-    } else {
-      reply = await callClaude(useModel, fullSystem, chatMessages, maxTokens);
-    }
+    const reply = await callModel(useModel, fullSystem, chatMessages, maxTokens);
 
     await supabase.from('messages').insert({
       session_id, role: 'assistant', content: reply, visible: true
@@ -209,6 +223,73 @@ app.post('/api/chat', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// === 日记 ===
+
+app.get('/api/diaries', async (req, res) => {
+  const { data, error } = await supabase
+    .from('diaries').select('*')
+    .order('created_at', { ascending: false })
+    .limit(100);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/api/diaries', async (req, res) => {
+  const { author, content } = req.body;
+  if (!author || !content) return res.status(400).json({ error: 'missing fields' });
+  const { data, error } = await supabase
+    .from('diaries').insert({ author, content }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.delete('/api/diaries/:id', async (req, res) => {
+  const { error } = await supabase
+    .from('diaries').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+// === 待办 ===
+
+app.get('/api/todos', async (req, res) => {
+  const { data, error } = await supabase
+    .from('todos').select('*')
+    .order('created_at', { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/api/todos', async (req, res) => {
+  const { side, text, due_time } = req.body;
+  if (!text) return res.status(400).json({ error: 'missing text' });
+  const { data, error } = await supabase
+    .from('todos').insert({ side: side || 'her', text, due_time }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.put('/api/todos/:id', async (req, res) => {
+  const { done, text, due_time } = req.body;
+  const update = {};
+  if (done !== undefined) update.done = done;
+  if (text !== undefined) update.text = text;
+  if (due_time !== undefined) update.due_time = due_time;
+  const { data, error } = await supabase
+    .from('todos').update(update).eq('id', req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.delete('/api/todos/:id', async (req, res) => {
+  const { error } = await supabase
+    .from('todos').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+// === 启动 ===
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
