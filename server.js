@@ -224,6 +224,15 @@ app.post('/api/diaries', async (req, res) => {
   res.json(data);
 });
 
+app.put('/api/diaries/:id', async (req, res) => {
+  const { content } = req.body;
+  if (!content) return res.status(400).json({ error: 'missing content' });
+  const { data, error } = await supabase
+    .from('diaries').update({ content }).eq('id', req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
 app.delete('/api/diaries/:id', async (req, res) => {
   const { error } = await supabase.from('diaries').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
