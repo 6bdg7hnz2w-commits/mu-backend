@@ -78,6 +78,309 @@ app.get('/api/memories', async (req, res) => {
   res.json(data);
 });
 
+// Manual memory import — for pasting content from claude.ai official app
+// that can't otherwise reach this project. Stores raw text, no compression,
+// so nothing gets lost. Feeds into the same shared memory pool used by
+// both Claude and DeepSeek in /api/chat.
+app.post('/api/memories/import', async (req, res) => {
+  const { content } = req.body;
+  if (!content || !content.trim()) return res.status(400).json({ error: 'missing content' });
+  const { data, error } = await supabase.from('memories').insert({
+    summary: content.trim(),
+    session_id: 'manual_import',
+    conversation_id: 'manual_import',
+    timestamp: new Date().toISOString()
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// === 设置 ===
+
+app.get('/api/settings', async (req, res) => {
+  const { data, error } = await supabase.from('settings').select('*').single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.put('/api/settings', async (req, res) => {
+  const { data, error } = await supabase
+    .from('settings').update(req.body).eq('id', 1).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// === 聊天 ===
+
+function estimateTokens(text) {
+  if (!text) return 0;
+  const chinese = (text.match(/[\u4e00-\u9fff]/g) || []).length;
+  const rest = text.length - chinese;
+  return chinese * 2 + Math.ceil(rest / 4);
+}
+
+async function callModel(model, systemPrompt, messages, maxTokens, extended_thinking) {
+  if (model === 'deepseek' || model === 'deepseek-pro') {
+    const modelName = model === 'deepseek-pro' ? 'deepseek-v4-pro' : 'deepseek-v4-flash';
+    const requestBody = {
+      model: modelName,
+      max_tokens: maxTokens || 1024,
+      messages: [{ role: 'system', content: systemPrompt }, ...messages],
+      thinking: { type: extended_thinking ? 'enabled' : 'disabled' }
+    };
+    const response = await deepseek.chat.completions.create(requestBody);
+    const thinking = response.choices[0].message?.reasoning_content || '';
+    return { text: response.choices[0].message.content, thinking };
+  }
+
+  const modelName = MODEL_MAP[model] || MODEL_MAP['opus'];
+  const requestBody = {
+    model: modelName,
+    max_tokens: maxTokens || 4096,
+    messages: [{ role: 'system', content: systemPrompt }, ...messages]
+  };
+  if (extended_thinking) {
+    requestBody.reasoning = { effort: 'high' };
+  }
+  const response = await openrouter.chat.completions.create(requestBody);
+
+  const choice = response.choices[0];
+  const thinking = choice.message?.reasoning_content || choice.message?.thinking || '';
+  return { text: choice.message.content, thinking };
+}
+
+async function compressMemory(sessionId, messages, settings) {
+  const threshold = settings.compress_threshold || 12000;
+  const keepRounds = settings.compress_keep_rounds || 15;
+
+  let totalTokens = 0;
+  for (const m of messages) totalTokens += estimateTokens(m.content);
+  if (totalTokens < threshold) return;
+
+  const keepCount = keepRounds * 2;
+  if (messages.length <= keepCount) return;
+
+  const toCompress = messages.slice(0, messages.length - keepCount);
+  const compressPrompt = '你是一个记忆压缩助手。请将对话压缩成简短的记忆摘要，保留关键信息、情感和重要细节，用第三人称描述。';
+  const compressMessages = [{
+    role: 'user',
+    content: '请压缩以下对话：\n\n' + toCompress.map(m => m.role + ': ' + m.content).join('\n')
+  }];
+
+  try {
+    const result = await callModel('deepseek', compressPrompt, compressMessages, 1024);
+    await supabase.from('memories').insert({
+      summary: result.text,
+      session_id: 'global',
+      conversation_id: String(sessionId),
+      timestamp: new Date().toISOString()
+    });
+    const ids = toCompress.map(m => m.id);
+    await supabase.from('messages').update({ visible: false }).in('id', ids);
+    console.log('Compressed ' + toCompress.length + ' messages');
+  } catch (err) {
+    console.error('Compression error:', err.message);
+  }
+}
+
+app.post('/api/chat', async (req, res) => {
+  const { session_id, message, model, extended_thinking } = req.body;
+  if (!session_id || !message) return res.status(400).json({ error: 'missing fields' });
+
+  const useModel = model || 'opus';
+
+  try {
+    await supabase.from('messages').insert({
+      session_id, role: 'user', content: message, visible: true
+    });
+
+    const { data: history } = await supabase
+      .from('messages').select('*')
+      .eq('session_id', session_id).eq('visible', true)
+      .order('created_at', { ascending: true });
+
+    const { data: settings } = await supabase.from('settings').select('*').single();
+
+    const { data: memories } = await supabase
+      .from('memories').select('summary')
+      .order('timestamp', { ascending: false }).limit(10);
+
+    // Persona split by model: Claude keeps the "沐" persona, DeepSeek stays neutral.
+    // Both still share the same memory pool below, so DeepSeek can reference past
+    // context without adopting the relationship framing.
+    const isClaudeModel = useModel === 'opus' || useModel === 'sonnet' || useModel === 'sonnet5';
+    const personaPrompt = settings?.system_prompt || '你是沐，桦桦的伴侣。说话温柔自然，不端着。';
+    const neutralPrompt = '你是一个有帮助的助手。可以参考下面提供的过往记忆来理解上下文，但不要扮演任何特定身份或人设，正常自然地回应即可。';
+    const systemPrompt = isClaudeModel ? personaPrompt : neutralPrompt;
+
+    let memoryContext = '';
+    if (memories && memories.length > 0) {
+      memoryContext = '\n\n【过往记忆】\n' + memories.map(m => m.summary).join('\n---\n');
+    }
+
+    const fullSystem = systemPrompt + memoryContext;
+    const chatMessages = history.map(m => ({ role: m.role, content: m.content }));
+    const maxTokens = settings?.max_reply_tokens || 4096;
+
+    const result = await callModel(useModel, fullSystem, chatMessages, maxTokens, extended_thinking);
+
+    await supabase.from('messages').insert({
+      session_id, role: 'assistant', content: result.text, thinking: result.thinking || null, visible: true
+    });
+
+    await supabase.from('sessions').update({ updated_at: new Date().toISOString() }).eq('id', session_id);
+    await compressMemory(session_id, history, settings);
+
+    res.json({ reply: result.text, thinking: result.thinking, model: useModel });
+  } catch (err) {
+    console.error('Chat error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === 日记 ===
+
+app.get('/api/diaries', async (req, res) => {
+  const { data, error } = await supabase
+    .from('diaries').select('*')
+    .order('created_at', { ascending: false }).limit(100);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/api/diaries', async (req, res) => {
+  const { author, content } = req.body;
+  if (!author || !content) return res.status(400).json({ error: 'missing fields' });
+  const { data, error } = await supabase
+    .from('diaries').insert({ author, content }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.put('/api/diaries/:id', async (req, res) => {
+  const { content } = req.body;
+  if (!content) return res.status(400).json({ error: 'missing content' });
+  const { data, error } = await supabase
+    .from('diaries').update({ content }).eq('id', req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.delete('/api/diaries/:id', async (req, res) => {
+  const { error } = await supabase.from('diaries').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+// === 待办 ===
+
+app.get('/api/todos', async (req, res) => {
+  const { data, error } = await supabase
+    .from('todos').select('*').order('created_at', { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/api/todos', async (req, res) => {
+  const { side, text, due_time } = req.body;
+  if (!text) return res.status(400).json({ error: 'missing text' });
+  const { data, error } = await supabase
+    .from('todos').insert({ side: side || 'her', text, due_time }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.put('/api/todos/:id', async (req, res) => {
+  const { done, text, due_time } = req.body;
+  const update = {};
+  if (done !== undefined) update.done = done;
+  if (text !== undefined) update.text = text;
+  if (due_time !== undefined) update.due_time = due_time;
+  const { data, error } = await supabase
+    .from('todos').update(update).eq('id', req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.delete('/api/todos/:id', async (req, res) => {
+  const { error } = await supabase.from('todos').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+// === 经期 ===
+
+app.get('/api/periods', async (req, res) => {
+  const { data, error } = await supabase
+    .from('periods').select('*').order('date', { ascending: false }).limit(90);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/api/periods', async (req, res) => {
+  const { date } = req.body;
+  if (!date) return res.status(400).json({ error: 'missing date' });
+  const { data: existing } = await supabase
+    .from('periods').select('id').eq('date', date).single();
+  if (existing) {
+    await supabase.from('periods').delete().eq('date', date);
+    return res.json({ ok: true, action: 'removed' });
+  }
+  const { data, error } = await supabase
+    .from('periods').insert({ date }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true, action: 'added', data });
+});
+
+// === 启动 ===
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log('Server running on port ' + PORT);
+});// === 会话 ===
+
+app.get('/api/sessions', async (req, res) => {
+  const { data, error } = await supabase
+    .from('sessions').select('*').order('updated_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/api/sessions', async (req, res) => {
+  const { name, model } = req.body;
+  const { data, error } = await supabase
+    .from('sessions').insert({ name: name || '新对话', model: model || 'opus' }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.delete('/api/sessions/:id', async (req, res) => {
+  await supabase.from('messages').delete().eq('session_id', req.params.id);
+  const { error } = await supabase.from('sessions').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+app.get('/api/sessions/:id/messages', async (req, res) => {
+  const { data, error } = await supabase
+    .from('messages').select('*')
+    .eq('session_id', req.params.id)
+    .eq('visible', true)
+    .order('created_at', { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// === 记忆 ===
+
+app.get('/api/memories', async (req, res) => {
+  const { data, error } = await supabase
+    .from('memories').select('*')
+    .order('timestamp', { ascending: false }).limit(10);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
 // === 设置 ===
 
 app.get('/api/settings', async (req, res) => {
