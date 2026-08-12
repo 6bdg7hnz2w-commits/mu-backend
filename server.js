@@ -23,9 +23,11 @@ const deepseek = new OpenAI({
 });
 
 const MODEL_MAP = {
-  'opus': 'anthropic/claude-opus-4',
-  'sonnet': 'anthropic/claude-sonnet-4',
-  'deepseek': 'deepseek-chat'
+  'opus': 'anthropic/claude-opus-4.6',
+  'sonnet': 'anthropic/claude-sonnet-4.6',
+  'sonnet5': 'anthropic/claude-sonnet-5',
+  'deepseek': 'deepseek-v4-flash',
+  'deepseek-pro': 'deepseek-v4-pro'
 };
 
 app.get('/health', (req, res) => {
@@ -101,15 +103,14 @@ function estimateTokens(text) {
 }
 
 async function callModel(model, systemPrompt, messages, maxTokens, extended_thinking) {
-  if (model === 'deepseek') {
+  if (model === 'deepseek' || model === 'deepseek-pro') {
+    const modelName = model === 'deepseek-pro' ? 'deepseek-v4-pro' : 'deepseek-v4-flash';
     const requestBody = {
-      model: 'deepseek-v4-flash',
+      model: modelName,
       max_tokens: maxTokens || 1024,
-      messages: [{ role: 'system', content: systemPrompt }, ...messages]
+      messages: [{ role: 'system', content: systemPrompt }, ...messages],
+      thinking: { type: extended_thinking ? 'enabled' : 'disabled' }
     };
-    if (extended_thinking) {
-      requestBody.extra_body = { thinking: { type: 'enabled' } };
-    }
     const response = await deepseek.chat.completions.create(requestBody);
     const thinking = response.choices[0].message?.reasoning_content || '';
     return { text: response.choices[0].message.content, thinking };
@@ -201,7 +202,7 @@ app.post('/api/chat', async (req, res) => {
     const result = await callModel(useModel, fullSystem, chatMessages, maxTokens, extended_thinking);
 
     await supabase.from('messages').insert({
-      session_id, role: 'assistant', content: result.text, visible: true
+      session_id, role: 'assistant', content: result.text, thinking: result.thinking || null, visible: true
     });
 
     await supabase.from('sessions').update({ updated_at: new Date().toISOString() }).eq('id', session_id);
