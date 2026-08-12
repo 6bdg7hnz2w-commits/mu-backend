@@ -100,22 +100,31 @@ function estimateTokens(text) {
   return chinese * 2 + Math.ceil(rest / 4);
 }
 
-async function callModel(model, systemPrompt, messages, maxTokens) {
+async function callModel(model, systemPrompt, messages, maxTokens, extended_thinking) {
   if (model === 'deepseek') {
-    const response = await deepseek.chat.completions.create({
-      model: 'deepseek-chat',
+    const requestBody = {
+      model: 'deepseek-v4-flash',
       max_tokens: maxTokens || 1024,
       messages: [{ role: 'system', content: systemPrompt }, ...messages]
-    });
-    return { text: response.choices[0].message.content, thinking: '' };
+    };
+    if (extended_thinking) {
+      requestBody.extra_body = { thinking: { type: 'enabled' } };
+    }
+    const response = await deepseek.chat.completions.create(requestBody);
+    const thinking = response.choices[0].message?.reasoning_content || '';
+    return { text: response.choices[0].message.content, thinking };
   }
 
   const modelName = MODEL_MAP[model] || MODEL_MAP['opus'];
-  const response = await openrouter.chat.completions.create({
+  const requestBody = {
     model: modelName,
     max_tokens: maxTokens || 4096,
     messages: [{ role: 'system', content: systemPrompt }, ...messages]
-  });
+  };
+  if (extended_thinking) {
+    requestBody.reasoning = { effort: 'high' };
+  }
+  const response = await openrouter.chat.completions.create(requestBody);
 
   const choice = response.choices[0];
   const thinking = choice.message?.reasoning_content || choice.message?.thinking || '';
@@ -157,7 +166,7 @@ async function compressMemory(sessionId, messages, settings) {
 }
 
 app.post('/api/chat', async (req, res) => {
-  const { session_id, message, model } = req.body;
+  const { session_id, message, model, extended_thinking } = req.body;
   if (!session_id || !message) return res.status(400).json({ error: 'missing fields' });
 
   const useModel = model || 'opus';
@@ -189,7 +198,7 @@ app.post('/api/chat', async (req, res) => {
     const chatMessages = history.map(m => ({ role: m.role, content: m.content }));
     const maxTokens = settings?.max_reply_tokens || 4096;
 
-    const result = await callModel(useModel, fullSystem, chatMessages, maxTokens);
+    const result = await callModel(useModel, fullSystem, chatMessages, maxTokens, extended_thinking);
 
     await supabase.from('messages').insert({
       session_id, role: 'assistant', content: result.text, visible: true
