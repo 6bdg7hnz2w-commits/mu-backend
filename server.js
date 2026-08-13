@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
@@ -149,6 +150,32 @@ async function callModel(model, systemPrompt, messages, maxTokens, extended_thin
   return { text: choice.message.content, thinking };
 }
 
+const MOOD_LABELS = ['confused', 'curious', 'happy', 'sad', 'worried', 'playful', 'loving', 'calm', 'tired'];
+
+// Lightweight post-hoc classification of an assistant reply's emotional tone.
+// Runs on deepseek (cheap/fast) after the reply is already sent to the user,
+// so it never adds latency to /api/chat.
+async function classifyMood(text) {
+  const prompt = '你是一个情绪分类器。阅读下面这段回复文本，判断说话者当下的情绪基调，只能从这些标签里选一个：' +
+    MOOD_LABELS.join(', ') + '。只输出标签本身，不要输出任何其他文字或标点。';
+  try {
+    const response = await deepseek.chat.completions.create({
+      model: 'deepseek-v4-flash',
+      max_tokens: 10,
+      thinking: { type: 'disabled' },
+      messages: [
+        { role: 'system', content: prompt },
+        { role: 'user', content: text }
+      ]
+    });
+    const label = (response.choices[0].message.content || '').trim().toLowerCase();
+    return MOOD_LABELS.includes(label) ? label : 'calm';
+  } catch (err) {
+    console.error('Mood classification error:', err.message);
+    return null;
+  }
+}
+
 async function compressMemory(sessionId, messages, settings) {
   const threshold = settings.compress_threshold || 12000;
   const keepRounds = settings.compress_keep_rounds || 15;
@@ -227,18 +254,45 @@ app.post('/api/chat', async (req, res) => {
 
     const result = await callModel(useModel, fullSystem, chatMessages, maxTokens, extended_thinking);
 
-    await supabase.from('messages').insert({
+    const { data: inserted } = await supabase.from('messages').insert({
       session_id, role: 'assistant', content: result.text, thinking: result.thinking || null, visible: true
-    });
+    }).select().single();
 
     await supabase.from('sessions').update({ updated_at: new Date().toISOString() }).eq('id', session_id);
     await compressMemory(session_id, history, settings);
 
     res.json({ reply: result.text, thinking: result.thinking, model: useModel });
+
+    if (inserted?.id) {
+      classifyMood(result.text).then(async (mood) => {
+        if (!mood) return;
+        await supabase.from('messages').update({ mood }).eq('id', inserted.id);
+      }).catch(err => console.error('Mood tagging error:', err.message));
+    }
   } catch (err) {
     console.error('Chat error:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// === mochi ===
+
+const MOOD_ACTIVE_WINDOW_MS = 5 * 60 * 1000;
+
+app.get('/api/mochi/mood', async (req, res) => {
+  const { data, error } = await supabase
+    .from('messages').select('mood, created_at')
+    .eq('role', 'assistant').eq('visible', true)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (error) return res.status(500).json({ error: error.message });
+
+  const latest = data && data[0];
+  const active = !!latest && (Date.now() - new Date(latest.created_at).getTime()) < MOOD_ACTIVE_WINDOW_MS;
+  const mood = latest?.mood || 'calm';
+  const poll_interval = active ? 3 : Math.floor(Math.random() * 6) + 15;
+
+  res.json({ active, mood, poll_interval });
 });
 
 // === 日记 ===
