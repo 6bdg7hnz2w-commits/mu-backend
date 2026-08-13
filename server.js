@@ -281,7 +281,7 @@ const MOOD_ACTIVE_WINDOW_MS = 5 * 60 * 1000;
 
 app.get('/api/mochi/mood', async (req, res) => {
   const { data, error } = await supabase
-    .from('messages').select('mood, created_at')
+    .from('messages').select('id, mood, created_at')
     .eq('role', 'assistant').eq('visible', true)
     .order('created_at', { ascending: false })
     .limit(1);
@@ -292,7 +292,9 @@ app.get('/api/mochi/mood', async (req, res) => {
   const mood = latest?.mood || 'calm';
   const poll_interval = active ? 3 : Math.floor(Math.random() * 6) + 15;
 
-  res.json({ active, mood, poll_interval });
+  // message_id让客户端能区分"同一条消息还在轮询"和"来了条新回复"，
+  // 即使新回复的mood标签跟上一条一样，也应该触发一次新的表情播放。
+  res.json({ active, mood, poll_interval, message_id: latest?.id ?? null });
 });
 
 // === 日记 ===
