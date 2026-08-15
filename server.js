@@ -150,7 +150,7 @@ async function callModel(model, systemPrompt, messages, maxTokens, extended_thin
   return { text: choice.message.content, thinking };
 }
 
-const MOOD_LABELS = ['confused', 'curious', 'happy', 'sad', 'worried', 'playful', 'loving', 'calm', 'tired'];
+const MOOD_LABELS = ['happy', 'sad', 'calm', 'tired', 'loving', 'curious', 'playful', 'confused', 'awkward', 'angry', 'speechless'];
 
 // Lightweight post-hoc classification of an assistant reply's emotional tone.
 // Runs on deepseek (cheap/fast) after the reply is already sent to the user,
