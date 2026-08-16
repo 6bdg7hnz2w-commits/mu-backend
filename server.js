@@ -35,6 +35,16 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: '沐在这里' });
 });
 
+// Temporary diagnostic route to check Render's outbound IP — remove after confirming region block cause.
+app.get('/debug/egress-ip', async (req, res) => {
+  try {
+    const ip = await fetch('https://ifconfig.me').then(r => r.text());
+    res.json({ ip: ip.trim() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // === 会话 ===
 
 app.get('/api/sessions', async (req, res) => {
@@ -389,6 +399,54 @@ app.post('/api/periods', async (req, res) => {
     .from('periods').insert({ date }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true, action: 'added', data });
+});
+
+// === 游戏：你画我猜 ===
+
+app.post('/api/games/draw-guess/start', async (req, res) => {
+  try {
+    const prompt = '你是一个"你画我猜"游戏的出题人。请随机想一个适合手绘涂鸦的具体名词(比如动物、日常物品、简单场景)，不要太抽象。只输出这个词本身，不要输出任何其他文字、标点或解释。';
+    const response = await deepseek.chat.completions.create({
+      model: 'deepseek-v4-flash',
+      max_tokens: 20,
+      thinking: { type: 'disabled' },
+      messages: [{ role: 'system', content: prompt }, { role: 'user', content: '出一个题' }]
+    });
+    const word = (response.choices[0].message.content || '').trim();
+    res.json({ word });
+  } catch (err) {
+    console.error('Draw-guess start error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/games/draw-guess/guess', async (req, res) => {
+  const { image, word } = req.body;
+  if (!image) return res.status(400).json({ error: 'missing image' });
+  try {
+    const response = await openrouter.chat.completions.create({
+      model: 'anthropic/claude-sonnet-4.6',
+      max_tokens: 300,
+      messages: [
+        { role: 'system', content: '你在玩"你画我猜"，对方画了一幅简笔画，请你猜猜画的是什么。用JSON格式回复，包含guess(你猜的词，尽量简短)和reason(简短说明你为什么这么猜，一两句话，语气活泼一点)两个字段，不要输出JSON以外的任何文字。' },
+        { role: 'user', content: [
+          { type: 'text', text: '这是ta画的画，你觉得画的是什么？' },
+          { type: 'image_url', image_url: { url: image } }
+        ]}
+      ]
+    });
+    if (!response.choices) throw new Error(response.error?.message || 'AI provider returned no choices');
+    let raw = response.choices[0].message.content || '{}';
+    console.log('raw AI response:', raw);
+    raw = raw.replace(/```json|```/g, '').trim();
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch { parsed = { guess: raw, reason: '' }; }
+    const correct = word ? !!(parsed.guess && (parsed.guess.includes(word) || word.includes(parsed.guess))) : null;
+    res.json({ guess: parsed.guess, reason: parsed.reason, correct });
+  } catch (err) {
+    console.error('Draw-guess guess error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // === 启动 ===
