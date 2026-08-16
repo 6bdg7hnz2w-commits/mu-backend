@@ -35,16 +35,6 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: '沐在这里' });
 });
 
-// Temporary diagnostic route to check Render's outbound IP — remove after confirming region block cause.
-app.get('/debug/egress-ip', async (req, res) => {
-  try {
-    const ip = await fetch('https://ifconfig.me').then(r => r.text());
-    res.json({ ip: ip.trim() });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // === 会话 ===
 
 app.get('/api/sessions', async (req, res) => {
