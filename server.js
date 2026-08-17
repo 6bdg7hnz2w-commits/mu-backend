@@ -453,7 +453,8 @@ ${memoryContext}
         const barkController = new AbortController();
         const barkTimeout = setTimeout(() => barkController.abort(), 10000);
         try {
-          await fetch(`https://api.day.app/${barkToken}/${encodeURIComponent('沐找你了')}/${encodeURIComponent(reply)}`, { signal: barkController.signal });
+          const barkIcon = encodeURIComponent('https://ctgudttenrybcfpgyewh.supabase.co/storage/v1/object/public/assets/IMG_7973.JPG');
+          await fetch(`https://api.day.app/${barkToken}/${encodeURIComponent('沐找你了')}/${encodeURIComponent(reply)}?icon=${barkIcon}`, { signal: barkController.signal });
         } catch (err) {
           console.error('Bark push error:', err.message);
         } finally {
