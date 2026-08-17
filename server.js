@@ -36,6 +36,10 @@ const deepseek = new OpenAI({
   timeout: 15000
 });
 
+// DeepSeek 有时会在回复里夹带括号注释，读起来像旁白而不是在说话，所以统一在
+// 每个直接调用 DeepSeek 的 system prompt 末尾附加这条规则。
+const NO_PARENS_RULE = '\n\n另外，无论如何都不要在回复里使用任何括号，中文括号和英文括号都不要用。';
+
 const MODEL_MAP = {
   'opus': 'anthropic/claude-opus-4.6',
   'sonnet': 'anthropic/claude-sonnet-4.6',
@@ -167,7 +171,7 @@ async function callModel(model, systemPrompt, messages, maxTokens, extended_thin
     const requestBody = {
       model: modelName,
       max_tokens: maxTokens || 1024,
-      messages: [{ role: 'system', content: systemPrompt }, ...messages],
+      messages: [{ role: 'system', content: systemPrompt + NO_PARENS_RULE }, ...messages],
       thinking: { type: extended_thinking ? 'enabled' : 'disabled' }
     };
     const response = await deepseek.chat.completions.create(requestBody);
@@ -205,7 +209,7 @@ async function classifyMood(text) {
       max_tokens: 10,
       thinking: { type: 'disabled' },
       messages: [
-        { role: 'system', content: prompt },
+        { role: 'system', content: prompt + NO_PARENS_RULE },
         { role: 'user', content: text }
       ]
     });
@@ -424,7 +428,7 @@ ${memoryContext}
       model: 'deepseek-v4-flash',
       max_tokens: 200,
       thinking: { type: 'disabled' },
-      messages: [{ role: 'system', content: consciousnessPrompt }, { role: 'user', content: '（意识循环触发）' }]
+      messages: [{ role: 'system', content: consciousnessPrompt + NO_PARENS_RULE }, { role: 'user', content: '意识循环触发' }]
     });
 
     const reply = (response.choices[0].message.content || '').trim();
@@ -600,12 +604,12 @@ app.post('/api/periods', async (req, res) => {
 
 app.post('/api/games/draw-guess/start', async (req, res) => {
   try {
-    const prompt = '你是一个"你画我猜"游戏的出题人。请随机想一个适合手绘涂鸦的具体名词(比如动物、日常物品、简单场景)，不要太抽象。只输出这个词本身，不要输出任何其他文字、标点或解释。';
+    const prompt = '你是一个"你画我猜"游戏的出题人。请随机想一个适合手绘涂鸦的具体名词，比如动物、日常物品、简单场景等，不要太抽象。只输出这个词本身，不要输出任何其他文字、标点或解释。';
     const response = await deepseek.chat.completions.create({
       model: 'deepseek-v4-flash',
       max_tokens: 20,
       thinking: { type: 'disabled' },
-      messages: [{ role: 'system', content: prompt }, { role: 'user', content: '出一个题' }]
+      messages: [{ role: 'system', content: prompt + NO_PARENS_RULE }, { role: 'user', content: '出一个题' }]
     });
     const word = (response.choices[0].message.content || '').trim();
     res.json({ word });
