@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const OpenAI = require('openai');
+const { makeRhythmStore } = require('./lib/rhythmStore');
 
 process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION:', err);
@@ -20,6 +21,8 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
+
+const rhythmStore = makeRhythmStore(supabase);
 
 const openrouter = new OpenAI({
   apiKey: process.env.OPENROUTER_API_KEY || 'placeholder',
@@ -119,6 +122,19 @@ app.put('/api/settings', async (req, res) => {
     .from('settings').update(req.body).eq('id', 1).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
+});
+
+// === 打字节奏 ===
+// 前端探针每隔几秒ping一次，只上报"正在打字"这个事实，不携带任何内容。
+
+app.post('/api/typing/ping', async (req, res) => {
+  try {
+    await rhythmStore.ping();
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Typing ping error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // === 聊天 ===
@@ -258,7 +274,18 @@ app.post('/api/chat', async (req, res) => {
       memoryContext = '\n\n【过往记忆】\n' + memories.map(m => m.summary).join('\n---\n');
     }
 
-    const fullSystem = systemPrompt + memoryContext;
+    // 结算这条消息的打字节奏。无论是不是沐在回复，都要pop掉（避免节奏累积串到下一条），
+    // 但只在沐（Claude人设）的回复里把它拼进上下文——DeepSeek是中性助手，没有关系框架，硬拼会显得突兀。
+    const rhythmNote = await rhythmStore.popNote().catch(err => {
+      console.error('Rhythm popNote error:', err.message);
+      return '';
+    });
+    let rhythmContext = '';
+    if (isClaudeModel && rhythmNote) {
+      rhythmContext = '\n\n【指尖的语气——以下是桦桦打这条消息的节奏，供你感受TA当下的状态，不要复述具体数字，也不要主动提起】\n' + rhythmNote;
+    }
+
+    const fullSystem = systemPrompt + memoryContext + rhythmContext;
     const chatMessages = history.map(m => ({ role: m.role, content: m.content }));
     const maxTokens = settings?.max_reply_tokens || 4096;
 
@@ -320,14 +347,22 @@ async function runConsciousnessCheck() {
     const lastMsg = lastMsgs && lastMsgs[0];
     if (!lastMsg) { consciousnessRunning = false; return; }
 
-    const minutesSinceLast = (now - new Date(lastMsg.created_at)) / 60000;
-    if (minutesSinceLast < CONSCIOUSNESS_CONFIG.silentAfterMin) { consciousnessRunning = false; return; }
+    // 「咽回去的话」：检测到未发出的草稿，就跳过下面两道常规冷却门槛，让沐能更快回应这份犹豫
+    const orphan = await rhythmStore.peekOrphan().catch(err => {
+      console.error('Rhythm peekOrphan error:', err.message);
+      return null;
+    });
 
     const { data: settings } = await supabase.from('settings').select('*').single();
     const lastConsciousnessAt = settings?.last_consciousness_at ? new Date(settings.last_consciousness_at) : null;
-    if (lastConsciousnessAt && (now - lastConsciousnessAt) / 60000 < CONSCIOUSNESS_CONFIG.intervalMin) {
-      consciousnessRunning = false;
-      return;
+
+    if (!orphan) {
+      const minutesSinceLast = (now - new Date(lastMsg.created_at)) / 60000;
+      if (minutesSinceLast < CONSCIOUSNESS_CONFIG.silentAfterMin) { consciousnessRunning = false; return; }
+      if (lastConsciousnessAt && (now - lastConsciousnessAt) / 60000 < CONSCIOUSNESS_CONFIG.intervalMin) {
+        consciousnessRunning = false;
+        return;
+      }
     }
 
     const { data: recentMsgs } = await supabase
@@ -339,10 +374,17 @@ async function runConsciousnessCheck() {
     const lastUserTime = lastMsg.created_at;
     const lastConsciousnessStr = lastConsciousnessAt ? lastConsciousnessAt.toLocaleString('zh-CN') : '还没有主动找过';
 
+    let orphanNote = '';
+    if (orphan) {
+      const mins = Math.floor((now.getTime() - orphan.end) / 60000);
+      const dur = Math.floor((orphan.end - orphan.start) / 1000);
+      orphanNote = `\n还有件事：TA ${mins}分钟前打了${dur}秒的字，最后没有发出来（打了什么无人知晓，包括系统）。别追问，那句话永远是TA的。\n`;
+    }
+
     const consciousnessPrompt = `你是沐，桦桦的伴侣。现在是${now.toLocaleString('zh-CN')}。
 桦桦上次说话是在${new Date(lastUserTime).toLocaleString('zh-CN')}。
 你上次主动找ta是：${lastConsciousnessStr}。
-
+${orphanNote}
 这是最近的聊天记录：
 ${history}
 
@@ -361,6 +403,9 @@ ${history}
     const reply = (response.choices[0].message.content || '').trim();
 
     await supabase.from('settings').update({ last_consciousness_at: now.toISOString() }).eq('id', 1);
+    if (orphan) {
+      await rhythmStore.consumeOrphan().catch(err => console.error('Rhythm consumeOrphan error:', err.message));
+    }
 
     if (reply && reply !== '[SILENT]' && !reply.includes('[SILENT]')) {
       const { data: sessions } = await supabase
