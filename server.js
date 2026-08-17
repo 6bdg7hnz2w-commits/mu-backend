@@ -87,7 +87,7 @@ app.get('/api/sessions/:id/messages', async (req, res) => {
 app.get('/api/memories', async (req, res) => {
   const { data, error } = await supabase
     .from('memories').select('*')
-    .order('timestamp', { ascending: false }).limit(10);
+    .order('timestamp', { ascending: false }).limit(100);
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -107,6 +107,12 @@ app.post('/api/memories/import', async (req, res) => {
   }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
+});
+
+app.delete('/api/memories/:id', async (req, res) => {
+  const { error } = await supabase.from('memories').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
 });
 
 // === 设置 ===
