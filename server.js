@@ -4,6 +4,14 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const OpenAI = require('openai');
 
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('UNHANDLED REJECTION:', reason);
+});
+
 const app = express();
 app.use(cors());
 app.use(express.json());
