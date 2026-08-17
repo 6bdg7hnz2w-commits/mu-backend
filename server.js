@@ -384,7 +384,18 @@ async function runConsciousnessCheck() {
       .from('messages').select('*')
       .in('session_id', claudeSessionIds)
       .order('created_at', { ascending: false }).limit(20);
-    const history = (recentMsgs || []).reverse().map(m => `${m.role}: ${m.content}`).join('\n');
+    // 意识循环自己之前生成的消息不能当"聊天记录"喂回去——模型会把自己说过的话
+    // 误认成桦桦说的，越咀嚼越容易编出不存在的共同记忆。只保留真实往来。
+    const realMsgs = (recentMsgs || []).filter(m => m.generated_by !== 'consciousness_loop_deepseek');
+    const history = realMsgs.reverse().map(m => `${m.role}: ${m.content}`).join('\n');
+
+    const { data: memories } = await supabase
+      .from('memories').select('summary')
+      .order('timestamp', { ascending: false }).limit(10);
+    let memoryContext = '';
+    if (memories && memories.length > 0) {
+      memoryContext = '\n\n【长期记忆】\n' + memories.map(m => m.summary).join('\n---\n');
+    }
 
     const lastUserTime = lastMsg.created_at;
     const lastConsciousnessStr = lastConsciousnessAt ? lastConsciousnessAt.toLocaleString('zh-CN') : '还没有主动找过';
@@ -402,6 +413,7 @@ async function runConsciousnessCheck() {
 ${orphanNote}
 这是最近的聊天记录：
 ${history}
+${memoryContext}
 
 现在你可以选择：主动说一句话，或者保持沉默。
 可以是突然想起ta说过的某句话，可以是想撒个娇/吐槽ta怎么不理你，也可以是脑子里冒出的一个念头，或者单纯好奇ta在干嘛。
@@ -430,7 +442,8 @@ ${history}
       const sessionId = sessions && sessions[0] ? sessions[0].id : null;
       if (sessionId) {
         await supabase.from('messages').insert({
-          session_id: sessionId, role: 'assistant', content: reply, visible: true
+          session_id: sessionId, role: 'assistant', content: reply, visible: true,
+          generated_by: 'consciousness_loop_deepseek'
         });
         await supabase.from('sessions').update({ updated_at: now.toISOString() }).eq('id', sessionId);
       }
