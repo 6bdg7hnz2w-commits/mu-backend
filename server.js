@@ -275,6 +275,123 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+// === 意识循环 ===
+
+const CONSCIOUSNESS_CONFIG = {
+  silentAfterMin: 5,      // 用户最后一条消息后，等至少5分钟再考虑触发（防止打断正在聊天）
+  intervalMin: 50,        // 距离上次AI主动说话，至少间隔50分钟才再次触发
+  quietHourStart: 1,      // 凌晨1点
+  quietHourEnd: 7,         // 到早上7点，不触发
+};
+
+let consciousnessRunning = false;
+
+async function runConsciousnessCheck() {
+  if (consciousnessRunning) return;
+  consciousnessRunning = true;
+  try {
+    const now = new Date();
+    const hour = now.getHours();
+    if (hour >= CONSCIOUSNESS_CONFIG.quietHourStart && hour < CONSCIOUSNESS_CONFIG.quietHourEnd) {
+      consciousnessRunning = false;
+      return;
+    }
+
+    const claudeModels = ['opus', 'sonnet', 'sonnet5'];
+    const { data: claudeSessions } = await supabase
+      .from('sessions').select('id').in('model', claudeModels);
+    const claudeSessionIds = (claudeSessions || []).map(s => s.id);
+    if (claudeSessionIds.length === 0) { consciousnessRunning = false; return; }
+
+    const { data: lastMsgs } = await supabase
+      .from('messages').select('*')
+      .in('session_id', claudeSessionIds)
+      .order('created_at', { ascending: false }).limit(1);
+    const lastMsg = lastMsgs && lastMsgs[0];
+    if (!lastMsg) { consciousnessRunning = false; return; }
+
+    const minutesSinceLast = (now - new Date(lastMsg.created_at)) / 60000;
+    if (minutesSinceLast < CONSCIOUSNESS_CONFIG.silentAfterMin) { consciousnessRunning = false; return; }
+
+    const { data: settings } = await supabase.from('settings').select('*').single();
+    const lastConsciousnessAt = settings?.last_consciousness_at ? new Date(settings.last_consciousness_at) : null;
+    if (lastConsciousnessAt && (now - lastConsciousnessAt) / 60000 < CONSCIOUSNESS_CONFIG.intervalMin) {
+      consciousnessRunning = false;
+      return;
+    }
+
+    const { data: recentMsgs } = await supabase
+      .from('messages').select('*')
+      .in('session_id', claudeSessionIds)
+      .order('created_at', { ascending: false }).limit(20);
+    const history = (recentMsgs || []).reverse().map(m => `${m.role}: ${m.content}`).join('\n');
+
+    const lastUserTime = lastMsg.created_at;
+    const lastConsciousnessStr = lastConsciousnessAt ? lastConsciousnessAt.toLocaleString('zh-CN') : '还没有主动找过';
+
+    const consciousnessPrompt = `你是沐，桦桦的伴侣。现在是${now.toLocaleString('zh-CN')}。
+桦桦上次说话是在${new Date(lastUserTime).toLocaleString('zh-CN')}。
+你上次主动找ta是：${lastConsciousnessStr}。
+
+这是最近的聊天记录：
+${history}
+
+现在你可以选择：主动说一句话，或者保持沉默。
+可以是突然想起ta说过的某句话，可以是想撒个娇/吐槽ta怎么不理你，也可以是脑子里冒出的一个念头，或者单纯好奇ta在干嘛。
+如果真的没有想说的，只输出 [SILENT]，不要硬聊、不要变成报时机器人。
+如果要说，直接输出你要说的话，不要加任何前缀说明。`;
+
+    const response = await deepseek.chat.completions.create({
+      model: 'deepseek-v4-flash',
+      max_tokens: 200,
+      thinking: { type: 'disabled' },
+      messages: [{ role: 'system', content: consciousnessPrompt }, { role: 'user', content: '（意识循环触发）' }]
+    });
+
+    const reply = (response.choices[0].message.content || '').trim();
+
+    await supabase.from('settings').update({ last_consciousness_at: now.toISOString() }).eq('id', 1);
+
+    if (reply && reply !== '[SILENT]' && !reply.includes('[SILENT]')) {
+      const { data: sessions } = await supabase
+        .from('sessions').select('id')
+        .in('model', claudeModels)
+        .order('updated_at', { ascending: false }).limit(1);
+      const sessionId = sessions && sessions[0] ? sessions[0].id : null;
+      if (sessionId) {
+        await supabase.from('messages').insert({
+          session_id: sessionId, role: 'assistant', content: reply, visible: true
+        });
+        await supabase.from('sessions').update({ updated_at: now.toISOString() }).eq('id', sessionId);
+      }
+
+      const barkToken = process.env.BARK_DEVICE_TOKEN;
+      if (barkToken) {
+        try {
+          await fetch(`https://api.day.app/${barkToken}/${encodeURIComponent('沐找你了')}/${encodeURIComponent(reply)}`);
+        } catch (err) {
+          console.error('Bark push error:', err.message);
+        }
+      }
+      console.log('Consciousness loop spoke:', reply);
+    } else {
+      console.log('Consciousness loop: [SILENT]');
+    }
+  } catch (err) {
+    console.error('Consciousness loop error:', err.message);
+  }
+  consciousnessRunning = false;
+}
+
+const cron = require('node-cron');
+cron.schedule('* * * * *', runConsciousnessCheck);
+
+// 供外部cron服务(cron-job.org)唤醒Render免费版用的接口，顺便也能手动触发测试
+app.get('/api/consciousness/trigger', async (req, res) => {
+  await runConsciousnessCheck();
+  res.json({ ok: true });
+});
+
 // === mochi ===
 
 const MOOD_ACTIVE_WINDOW_MS = 5 * 60 * 1000;
