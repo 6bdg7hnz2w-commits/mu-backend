@@ -23,12 +23,14 @@ const supabase = createClient(
 
 const openrouter = new OpenAI({
   apiKey: process.env.OPENROUTER_API_KEY || 'placeholder',
-  baseURL: 'https://openrouter.ai/api/v1'
+  baseURL: 'https://openrouter.ai/api/v1',
+  timeout: 15000
 });
 
 const deepseek = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY || 'placeholder',
-  baseURL: 'https://api.deepseek.com'
+  baseURL: 'https://api.deepseek.com',
+  timeout: 15000
 });
 
 const MODEL_MAP = {
@@ -375,10 +377,14 @@ ${history}
 
       const barkToken = process.env.BARK_DEVICE_TOKEN;
       if (barkToken) {
+        const barkController = new AbortController();
+        const barkTimeout = setTimeout(() => barkController.abort(), 10000);
         try {
-          await fetch(`https://api.day.app/${barkToken}/${encodeURIComponent('沐找你了')}/${encodeURIComponent(reply)}`);
+          await fetch(`https://api.day.app/${barkToken}/${encodeURIComponent('沐找你了')}/${encodeURIComponent(reply)}`, { signal: barkController.signal });
         } catch (err) {
           console.error('Bark push error:', err.message);
+        } finally {
+          clearTimeout(barkTimeout);
         }
       }
       console.log('Consciousness loop spoke:', reply);
