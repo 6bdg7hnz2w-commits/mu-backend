@@ -4,6 +4,7 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const OpenAI = require('openai');
 const { makeRhythmStore } = require('./lib/rhythmStore');
+const { Readable } = require('node:stream');
 
 process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION:', err);
@@ -598,6 +599,42 @@ app.post('/api/periods', async (req, res) => {
     .from('periods').insert({ date }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true, action: 'added', data });
+});
+
+// === 语音合成 ===
+
+const ELEVENLABS_VOICE_ID = 'I4byl0i7btkt8LXqvzM5';
+
+app.post('/api/tts', async (req, res) => {
+  const { text } = req.body;
+  if (!text || !text.trim()) return res.status(400).json({ error: 'missing text' });
+  if (!process.env.ELEVENLABS_API_KEY) return res.status(500).json({ error: 'ELEVENLABS_API_KEY not configured' });
+
+  try {
+    const elevenRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': process.env.ELEVENLABS_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        text,
+        model_id: 'eleven_flash_v2_5',
+        voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+      })
+    });
+
+    if (!elevenRes.ok || !elevenRes.body) {
+      const errText = await elevenRes.text().catch(() => '');
+      throw new Error(`ElevenLabs error ${elevenRes.status}: ${errText}`);
+    }
+
+    res.setHeader('Content-Type', 'audio/mpeg');
+    Readable.fromWeb(elevenRes.body).pipe(res);
+  } catch (err) {
+    console.error('TTS error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // === 游戏：你画我猜 ===
