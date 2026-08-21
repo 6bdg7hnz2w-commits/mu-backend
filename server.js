@@ -605,6 +605,20 @@ app.post('/api/periods', async (req, res) => {
 
 const ELEVENLABS_VOICE_ID = 'I4byl0i7btkt8LXqvzM5';
 
+let voiceSettings = { stability: 0.65, similarity_boost: 0.8, speed: 0.85 };
+
+app.get('/api/settings/voice', (req, res) => {
+  res.json(voiceSettings);
+});
+
+app.put('/api/settings/voice', (req, res) => {
+  const { stability, similarity_boost, speed } = req.body;
+  if (stability !== undefined) voiceSettings.stability = stability;
+  if (similarity_boost !== undefined) voiceSettings.similarity_boost = similarity_boost;
+  if (speed !== undefined) voiceSettings.speed = speed;
+  res.json(voiceSettings);
+});
+
 app.post('/api/tts', async (req, res) => {
   const { text } = req.body;
   if (!text || !text.trim()) return res.status(400).json({ error: 'missing text' });
@@ -620,7 +634,7 @@ app.post('/api/tts', async (req, res) => {
       body: JSON.stringify({
         text,
         model_id: 'eleven_flash_v2_5',
-        voice_settings: { stability: 0.65, similarity_boost: 0.8, speed: 0.85 }
+        voice_settings: voiceSettings
       })
     });
 
