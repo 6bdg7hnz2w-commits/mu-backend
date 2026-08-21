@@ -620,7 +620,7 @@ app.post('/api/tts', async (req, res) => {
       body: JSON.stringify({
         text,
         model_id: 'eleven_flash_v2_5',
-        voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+        voice_settings: { stability: 0.65, similarity_boost: 0.8, speed: 0.85 }
       })
     });
 
