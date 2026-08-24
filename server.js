@@ -4,6 +4,7 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const OpenAI = require('openai');
 const { makeRhythmStore } = require('./lib/rhythmStore');
+const { computeForgeSelection } = require('./lib/forge');
 const { Readable } = require('node:stream');
 
 process.on('uncaughtException', (err) => {
@@ -87,6 +88,87 @@ app.get('/api/sessions/:id/messages', async (req, res) => {
   res.json(data);
 });
 
+// === 挑选式换窗 (Forge Picker) ===
+
+app.post('/api/sessions/forge/preview', async (req, res) => {
+  const { source_session_id, keep_message_ids } = req.body;
+  if (!source_session_id || !Array.isArray(keep_message_ids) || keep_message_ids.length === 0) {
+    return res.status(400).json({ error: 'missing fields' });
+  }
+  try {
+    const { data: messages, error } = await supabase
+      .from('messages').select('*')
+      .eq('session_id', source_session_id)
+      .order('created_at', { ascending: true });
+    if (error) return res.status(500).json({ error: error.message });
+
+    const selection = computeForgeSelection(messages || [], keep_message_ids);
+    const totalChars = selection.messages.reduce((sum, m) => sum + (m.content ? m.content.length : 0), 0);
+
+    res.json({
+      rounds: selection.rounds,
+      messages_kept: selection.messages_kept,
+      messages_skipped: selection.messages_skipped,
+      gaps: selection.gaps,
+      estimated_tokens: Math.round(totalChars / 2),
+      preview_messages: selection.messages.map((m) => ({
+        id: m.id, role: m.role, content: m.content, created_at: m.created_at, gap_before: m.gap_before
+      }))
+    });
+  } catch (err) {
+    console.error('Forge preview error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/sessions/forge/execute', async (req, res) => {
+  const { source_session_id, keep_message_ids, new_session_name } = req.body;
+  if (!source_session_id || !Array.isArray(keep_message_ids) || keep_message_ids.length === 0) {
+    return res.status(400).json({ error: 'missing fields' });
+  }
+  try {
+    const { data: sourceSession, error: sessionErr } = await supabase
+      .from('sessions').select('*').eq('id', source_session_id).single();
+    if (sessionErr) return res.status(500).json({ error: sessionErr.message });
+
+    const { data: messages, error } = await supabase
+      .from('messages').select('*')
+      .eq('session_id', source_session_id)
+      .order('created_at', { ascending: true });
+    if (error) return res.status(500).json({ error: error.message });
+
+    const selection = computeForgeSelection(messages || [], keep_message_ids);
+    if (selection.messages.length === 0) return res.status(400).json({ error: 'no messages selected' });
+
+    const name = new_session_name || ('续·' + sourceSession.name);
+    const { data: newSession, error: createErr } = await supabase
+      .from('sessions').insert({ name, model: sourceSession.model }).select().single();
+    if (createErr) return res.status(500).json({ error: createErr.message });
+
+    const rows = selection.messages.map((m) => ({
+      session_id: newSession.id,
+      role: m.role,
+      content: m.content,
+      created_at: m.created_at,
+      mood: m.mood,
+      thinking: m.thinking,
+      generated_by: m.generated_by,
+      visible: m.visible,
+      gap_before: m.gap_before
+    }));
+    const { error: insertErr } = await supabase.from('messages').insert(rows);
+    if (insertErr) {
+      await supabase.from('sessions').delete().eq('id', newSession.id);
+      return res.status(500).json({ error: insertErr.message });
+    }
+
+    res.json({ id: newSession.id, name: newSession.name });
+  } catch (err) {
+    console.error('Forge execute error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // === 记忆 ===
 
 app.get('/api/memories', async (req, res) => {
@@ -158,6 +240,31 @@ app.post('/api/typing/ping', async (req, res) => {
 });
 
 // === 聊天 ===
+
+// [用户/助手 MM-DD HH:mm] 前缀 + 断口分隔，只用于拼给AI模型的上下文，
+// 不改动数据库里的content原文，也不影响前端聊天界面显示。
+function formatChatTimestamp(created_at) {
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false
+  }).formatToParts(new Date(created_at));
+  const get = (type) => parts.find((p) => p.type === type)?.value;
+  return `${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`;
+}
+
+function buildChatMessages(history) {
+  const result = [];
+  for (const m of history) {
+    if (m.gap_before) {
+      result.push({ role: 'system', content: `—— ${m.gap_before} ——` });
+    }
+    const roleLabel = m.role === 'user' ? '用户' : '助手';
+    const moodSuffix = m.role === 'assistant' && m.mood ? ` · ${m.mood}` : '';
+    const prefix = `[${roleLabel} ${formatChatTimestamp(m.created_at)}${moodSuffix}]`;
+    result.push({ role: m.role, content: `${prefix} ${m.content}` });
+  }
+  return result;
+}
 
 function estimateTokens(text) {
   if (!text) return 0;
@@ -306,7 +413,7 @@ app.post('/api/chat', async (req, res) => {
     }
 
     const fullSystem = systemPrompt + memoryContext + rhythmContext;
-    const chatMessages = history.map(m => ({ role: m.role, content: m.content }));
+    const chatMessages = buildChatMessages(history);
     const maxTokens = settings?.max_reply_tokens || 4096;
 
     const result = await callModel(useModel, fullSystem, chatMessages, maxTokens, extended_thinking);
