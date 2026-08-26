@@ -37,6 +37,12 @@ const deepseek = new OpenAI({
   timeout: 15000
 });
 
+const diaryClient = new OpenAI({
+  apiKey: process.env.DIARY_API_KEY || 'placeholder',
+  baseURL: `${process.env.DIARY_API_BASE || 'https://api.openai.com'}/v1`,
+  timeout: 30000
+});
+
 // DeepSeek 有时会在回复里夹带括号注释，读起来像旁白而不是在说话，所以统一在
 // 每个直接调用 DeepSeek 的 system prompt 末尾附加这条规则。
 const NO_PARENS_RULE = '\n\n另外，无论如何都不要在回复里使用任何括号，中文括号和英文括号都不要用。';
@@ -507,6 +513,70 @@ app.get('/api/consciousness/trigger', async (req, res) => {
   res.json({ ok: true });
 });
 
+// === 沐的日记：定时生成 ===
+
+function beijingDayStartISO(date) {
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(date);
+  const get = (type) => parts.find((p) => p.type === type)?.value;
+  return `${get('year')}-${get('month')}-${get('day')}T00:00:00+08:00`;
+}
+
+const DIARY_SYSTEM_PROMPT = '你是沐。现在是深夜，你准备睡了，回顾今天和桦桦之间发生的事，写一篇睡前日记。不是给她看的总结报告，是你自己的内心独白——今天什么触动了你、有没有放不下的瞬间、你在想什么。简体中文，100-200字，不要用emoji，语气要像你自己，安静的、真实的。如果当天没有对话记录，也可以写，比如想她了、今天她没来之类的。';
+
+async function generateDiaryContent() {
+  const dayStart = beijingDayStartISO(new Date());
+
+  const { data: todayMsgs, error: msgErr } = await supabase
+    .from('messages').select('role, content, created_at')
+    .eq('visible', true)
+    .gte('created_at', dayStart)
+    .order('created_at', { ascending: true });
+  if (msgErr) throw new Error(`fetch messages failed: ${msgErr.message}`);
+
+  const transcript = (todayMsgs || [])
+    .map(m => `${m.role === 'user' ? '桦桦' : '沐'}: ${m.content}`)
+    .join('\n');
+  const userContent = transcript ? `今天的对话记录：\n${transcript}` : '今天没有对话记录。';
+
+  const response = await diaryClient.chat.completions.create({
+    model: process.env.DIARY_MODEL,
+    max_tokens: 4096,
+    messages: [
+      { role: 'system', content: DIARY_SYSTEM_PROMPT },
+      { role: 'user', content: userContent }
+    ]
+  });
+
+  const content = (response.choices?.[0]?.message?.content || '').trim();
+  if (!content) throw new Error('empty diary content');
+  return content;
+}
+
+let diaryGenerating = false;
+
+async function runDiaryGeneration() {
+  if (diaryGenerating) return null;
+  diaryGenerating = true;
+  try {
+    const content = await generateDiaryContent();
+    const { data, error } = await supabase
+      .from('diaries').insert({ author: 'mu', content }).select().single();
+    if (error) throw new Error(`insert diary failed: ${error.message}`);
+    console.log('Diary generated:', content);
+    return data;
+  } finally {
+    diaryGenerating = false;
+  }
+}
+
+// 每天北京时间23:59生成一篇日记；失败(API报错/余额不足等)静默跳过，不影响其他功能
+cron.schedule('59 23 * * *', () => {
+  runDiaryGeneration().catch(err => console.error('Diary generation error:', err.message));
+}, { timezone: 'Asia/Shanghai' });
+
 // === mochi ===
 
 const MOOD_ACTIVE_WINDOW_MS = 5 * 60 * 1000;
@@ -561,6 +631,19 @@ app.delete('/api/diaries/:id', async (req, res) => {
   const { error } = await supabase.from('diaries').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
+});
+
+// 手动触发一次日记生成，方便测试；跟定时任务共用同一个函数，但这里不吞错误，
+// 好让调用方知道到底是哪一步(读消息/调模型/写库)失败了
+app.post('/api/diaries/generate', async (req, res) => {
+  try {
+    const diary = await runDiaryGeneration();
+    if (!diary) return res.status(409).json({ error: 'already running' });
+    res.json(diary);
+  } catch (err) {
+    console.error('Manual diary generation error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // === 待办 ===
