@@ -719,9 +719,14 @@ const VOICE_PRESETS = {
 };
 
 app.post('/api/tts', async (req, res) => {
-  const { text, preset } = req.body;
+  let { text, preset } = req.body;
   if (!text || !text.trim()) return res.status(400).json({ error: 'missing text' });
   if (!process.env.ELEVENLABS_API_KEY) return res.status(500).json({ error: 'ELEVENLABS_API_KEY not configured' });
+
+  text = text.replace(/^\[助手[^\]]*\]\s*/g, '');
+  text = text.replace(/^(中文|英文|俄语|日语|法语|韩语)[：:]\s*/g, '');
+  text = text.trim();
+  if (!text) return res.status(400).json({ error: 'missing text' });
 
   const voiceSettings = VOICE_PRESETS[preset] || VOICE_PRESETS.calm;
 
