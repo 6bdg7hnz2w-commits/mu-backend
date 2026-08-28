@@ -32,7 +32,7 @@ const rhythmStore = makeRhythmStore(supabase);
 // 不再直连 OpenRouter。RELAY_API_KEY/RELAY_BASE_URL 是共用配置。
 const relay = new OpenAI({
   apiKey: process.env.RELAY_API_KEY || 'placeholder',
-  baseURL: `${process.env.RELAY_BASE_URL || 'https://cn.jixiangai.xyz'}/v1`,
+  baseURL: process.env.RELAY_BASE_URL || 'https://cn.jixiangai.xyz/v1',
   timeout: 30000
 });
 
