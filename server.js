@@ -986,6 +986,13 @@ app.post('/api/nook/annotations/:id/floors', async (req, res) => {
   res.json(data);
 });
 
+app.delete('/api/nook/annotations/:id', async (req, res) => {
+  await supabase.from('nook_annotation_floors').delete().eq('annotation_id', req.params.id);
+  const { error } = await supabase.from('nook_annotations').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
 // === 启动 ===
 
 const PORT = process.env.PORT || 3000;
