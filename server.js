@@ -994,6 +994,23 @@ app.delete('/api/nook/annotations/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
+// === 临时调试：探测中转站模型名 ===
+// 用完就删，别留在正式代码里。
+
+app.post('/api/debug/relay-probe', async (req, res) => {
+  const candidates = req.body?.models || [];
+  const results = [];
+  for (const model of candidates) {
+    try {
+      await relay.chat.completions.create({ model, max_tokens: 5, messages: [{ role: 'user', content: 'hi' }] });
+      results.push({ model, ok: true });
+    } catch (err) {
+      results.push({ model, ok: false, error: err.message });
+    }
+  }
+  res.json(results);
+});
+
 // === 启动 ===
 
 const PORT = process.env.PORT || 3000;
