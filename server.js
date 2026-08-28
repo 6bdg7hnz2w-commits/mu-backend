@@ -28,10 +28,12 @@ const supabase = createClient(
 
 const rhythmStore = makeRhythmStore(supabase);
 
-const openrouter = new OpenAI({
-  apiKey: process.env.OPENROUTER_API_KEY || 'placeholder',
-  baseURL: 'https://openrouter.ai/api/v1',
-  timeout: 15000
+// 所有 Claude 调用（聊天、日记、你画我猜）统一走中转站 cn.jixiangai.xyz，
+// 不再直连 OpenRouter。RELAY_API_KEY/RELAY_BASE_URL 是共用配置。
+const relay = new OpenAI({
+  apiKey: process.env.RELAY_API_KEY || 'placeholder',
+  baseURL: `${process.env.RELAY_BASE_URL || 'https://cn.jixiangai.xyz'}/v1`,
+  timeout: 30000
 });
 
 const deepseek = new OpenAI({
@@ -40,20 +42,16 @@ const deepseek = new OpenAI({
   timeout: 15000
 });
 
-const diaryClient = new OpenAI({
-  apiKey: process.env.DIARY_API_KEY || 'placeholder',
-  baseURL: `${process.env.DIARY_API_BASE || 'https://api.openai.com'}/v1`,
-  timeout: 30000
-});
-
 // DeepSeek 有时会在回复里夹带括号注释，读起来像旁白而不是在说话，所以统一在
 // 每个直接调用 DeepSeek 的 system prompt 末尾附加这条规则。
 const NO_PARENS_RULE = '\n\n另外，无论如何都不要在回复里使用任何括号，中文括号和英文括号都不要用。';
 
+// 中转站的模型名是站点自定义的，和 OpenRouter 的 "anthropic/claude-*" 命名不一样。
+// opus/sonnet/sonnet5 在这个中转站上只有带 "-thinking" 后缀的条目。
 const MODEL_MAP = {
-  'opus': 'anthropic/claude-opus-4.6',
-  'sonnet': 'anthropic/claude-sonnet-4.6',
-  'sonnet5': 'anthropic/claude-sonnet-5',
+  'opus': 'claude-opus-4-6-thinking',
+  'sonnet': 'claude-sonnet-4-6-thinking',
+  'sonnet5': 'claude-sonnet-5-thinking',
   'deepseek': 'deepseek-v4-flash',
   'deepseek-pro': 'deepseek-v4-pro'
 };
@@ -211,16 +209,15 @@ async function callModel(model, systemPrompt, messages, maxTokens, extended_thin
     return { text: response.choices[0].message.content, thinking };
   }
 
+  // opus/sonnet/sonnet5 在中转站上只有 "-thinking" 变体，思考过程始终跟着模型走，
+  // extended_thinking 这里不再需要额外的请求参数。
   const modelName = MODEL_MAP[model] || MODEL_MAP['opus'];
   const requestBody = {
     model: modelName,
     max_tokens: maxTokens || 4096,
     messages: [{ role: 'system', content: systemPrompt }, ...messages]
   };
-  if (extended_thinking) {
-    requestBody.reasoning = { effort: 'high' };
-  }
-  const response = await openrouter.chat.completions.create(requestBody);
+  const response = await relay.chat.completions.create(requestBody);
 
   const choice = response.choices[0];
   const thinking = choice.message?.reasoning_content || choice.message?.thinking || '';
@@ -544,7 +541,7 @@ async function generateDiaryContent() {
     .join('\n');
   const userContent = transcript ? `今天的对话记录：\n${transcript}` : '今天没有对话记录。';
 
-  const response = await diaryClient.chat.completions.create({
+  const response = await relay.chat.completions.create({
     model: process.env.DIARY_MODEL,
     max_tokens: 4096,
     messages: [
@@ -868,8 +865,8 @@ app.post('/api/games/draw-guess/guess', async (req, res) => {
   const { image, word } = req.body;
   if (!image) return res.status(400).json({ error: 'missing image' });
   try {
-    const response = await openrouter.chat.completions.create({
-      model: 'anthropic/claude-sonnet-4.6',
+    const response = await relay.chat.completions.create({
+      model: MODEL_MAP.sonnet,
       max_tokens: 300,
       messages: [
         { role: 'system', content: '你在玩"你画我猜"，对方画了一幅简笔画，请你猜猜画的是什么。用JSON格式回复，包含guess(你猜的词，尽量简短)和reason(简短说明你为什么这么猜，一两句话，语气活泼一点)两个字段，不要输出JSON以外的任何文字。' },
