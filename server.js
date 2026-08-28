@@ -4,7 +4,10 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const OpenAI = require('openai');
 const { makeRhythmStore } = require('./lib/rhythmStore');
-const { Readable } = require('node:stream');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const fsp = require('node:fs/promises');
+const path = require('node:path');
 
 process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION:', err);
@@ -15,7 +18,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 const app = express();
-app.use(cors());
+app.use(cors({ exposedHeaders: ['X-Audio-Duration'] }));
 app.use(express.json());
 
 const supabase = createClient(
@@ -718,19 +721,83 @@ const VOICE_PRESETS = {
   narrate: { stability: 0.75, similarity_boost: 0.85, speed: 0.9 }
 };
 
+function cleanTtsText(text) {
+  text = text.replace(/^\[助手[^\]]*\]\s*/g, '');
+  text = text.replace(/^(中文|英文|俄语|日语|法语|韩语)[：:]\s*/g, '');
+  return text.trim();
+}
+
+function resolvePreset(preset) {
+  return VOICE_PRESETS[preset] ? preset : 'calm';
+}
+
+// === TTS 音频缓存 ===
+// 按 (清洗后的文本 + preset) 的 SHA256 缓存生成好的 mp3，命中时直接读盘返回，
+// 不用再花 ElevenLabs 额度；30 天没被访问过的文件视为冷数据，定期清理掉。
+const AUDIO_CACHE_DIR = path.join(__dirname, 'audio-cache');
+fs.mkdirSync(AUDIO_CACHE_DIR, { recursive: true });
+
+const AUDIO_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const MP3_BITRATE_BPS = 128000; // ElevenLabs 这个接口默认输出 128kbps CBR mp3
+
+function ttsCacheKey(text, preset) {
+  return crypto.createHash('sha256').update(`${text}::${preset}`).digest('hex');
+}
+
+function ttsCachePath(text, preset) {
+  return path.join(AUDIO_CACHE_DIR, `${ttsCacheKey(text, preset)}.mp3`);
+}
+
+function estimateMp3DurationFromSize(byteLength) {
+  return (byteLength * 8) / MP3_BITRATE_BPS;
+}
+
+function estimateDurationFromText(text) {
+  const cjkMatches = text.match(/[一-鿿぀-ヿ가-힯]/g) || [];
+  const rest = text.replace(/[一-鿿぀-ヿ가-힯]/g, ' ');
+  const wordMatches = rest.match(/[A-Za-zА-Яа-яЁё'-]+/g) || [];
+  return cjkMatches.length * 0.3 + wordMatches.length * 0.4;
+}
+
+async function cleanupAudioCache() {
+  try {
+    const files = await fsp.readdir(AUDIO_CACHE_DIR);
+    const now = Date.now();
+    await Promise.all(files.map(async (file) => {
+      const filePath = path.join(AUDIO_CACHE_DIR, file);
+      try {
+        const stat = await fsp.stat(filePath);
+        if (now - stat.mtimeMs > AUDIO_CACHE_MAX_AGE_MS) await fsp.unlink(filePath);
+      } catch { /* file may have been removed concurrently, ignore */ }
+    }));
+  } catch (err) {
+    console.error('Audio cache cleanup error:', err.message);
+  }
+}
+cleanupAudioCache();
+setInterval(cleanupAudioCache, 24 * 60 * 60 * 1000);
+
 app.post('/api/tts', async (req, res) => {
   let { text, preset } = req.body;
   if (!text || !text.trim()) return res.status(400).json({ error: 'missing text' });
-  if (!process.env.ELEVENLABS_API_KEY) return res.status(500).json({ error: 'ELEVENLABS_API_KEY not configured' });
 
-  text = text.replace(/^\[助手[^\]]*\]\s*/g, '');
-  text = text.replace(/^(中文|英文|俄语|日语|法语|韩语)[：:]\s*/g, '');
-  text = text.trim();
+  text = cleanTtsText(text);
   if (!text) return res.status(400).json({ error: 'missing text' });
+  preset = resolvePreset(preset);
 
-  const voiceSettings = VOICE_PRESETS[preset] || VOICE_PRESETS.calm;
+  const cachePath = ttsCachePath(text, preset);
 
   try {
+    const cached = await fsp.readFile(cachePath).catch(() => null);
+    if (cached) {
+      fsp.utimes(cachePath, new Date(), new Date()).catch(() => {});
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('X-Audio-Duration', estimateMp3DurationFromSize(cached.length).toFixed(2));
+      return res.end(cached);
+    }
+
+    if (!process.env.ELEVENLABS_API_KEY) return res.status(500).json({ error: 'ELEVENLABS_API_KEY not configured' });
+
     const elevenRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
       method: 'POST',
       headers: {
@@ -740,7 +807,7 @@ app.post('/api/tts', async (req, res) => {
       body: JSON.stringify({
         text,
         model_id: 'eleven_multilingual_v2',
-        voice_settings: voiceSettings
+        voice_settings: VOICE_PRESETS[preset]
       })
     });
 
@@ -749,11 +816,32 @@ app.post('/api/tts', async (req, res) => {
       throw new Error(`ElevenLabs error ${elevenRes.status}: ${errText}`);
     }
 
+    const audioBuffer = Buffer.from(await elevenRes.arrayBuffer());
+    await fsp.writeFile(cachePath, audioBuffer);
+
     res.setHeader('Content-Type', 'audio/mpeg');
-    Readable.fromWeb(elevenRes.body).pipe(res);
+    res.setHeader('X-Audio-Duration', estimateMp3DurationFromSize(audioBuffer.length).toFixed(2));
+    res.end(audioBuffer);
   } catch (err) {
     console.error('TTS error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/tts/duration', async (req, res) => {
+  let { text, preset } = req.query;
+  if (!text || !text.trim()) return res.status(400).json({ error: 'missing text' });
+
+  text = cleanTtsText(text);
+  if (!text) return res.status(400).json({ error: 'missing text' });
+  preset = resolvePreset(preset);
+
+  const cachePath = ttsCachePath(text, preset);
+  try {
+    const stat = await fsp.stat(cachePath);
+    return res.json({ duration: estimateMp3DurationFromSize(stat.size) });
+  } catch {
+    return res.json({ duration: estimateDurationFromText(text) });
   }
 });
 
