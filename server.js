@@ -47,18 +47,18 @@ const deepseek = new OpenAI({
 const NO_PARENS_RULE = '\n\n另外，无论如何都不要在回复里使用任何括号，中文括号和英文括号都不要用。';
 
 // 中转站的模型名是站点自定义的，和 OpenRouter 的 "anthropic/claude-*" 命名不一样。
-// opus/sonnet/sonnet5 在这个中转站上只有带 "-thinking" 后缀的条目。
+// 方括号渠道标签是模型名字符串本身的一部分（不是装饰），少了就会 503 no available channel。
 const MODEL_MAP = {
-  'opus': 'claude-opus-4-6-thinking',
-  'sonnet': 'claude-sonnet-4-6-thinking',
-  'sonnet5': 'claude-sonnet-5-thinking',
+  'opus': '[C]claude-opus-4-6-thinking',
+  'sonnet': '[C1]claude-sonnet-4-6-thinking',
+  'sonnet5': '[C1]claude-sonnet-5-thinking',
   'deepseek': 'deepseek-v4-flash',
   'deepseek-pro': 'deepseek-v4-pro'
 };
 
 // 你画我猜、日记生成用这个：不需要走聊天用的 thinking 变体，
 // 用普通的 sonnet-4-6。
-const RELAY_DEFAULT_MODEL = 'claude-sonnet-4-6';
+const RELAY_DEFAULT_MODEL = '[N]claude-sonnet-4-6';
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: '沐在这里' });
@@ -992,23 +992,6 @@ app.delete('/api/nook/annotations/:id', async (req, res) => {
   const { error } = await supabase.from('nook_annotations').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
-});
-
-// === 临时调试：探测中转站模型名 ===
-// 用完就删，别留在正式代码里。
-
-app.post('/api/debug/relay-probe', async (req, res) => {
-  const candidates = req.body?.models || [];
-  const results = [];
-  for (const model of candidates) {
-    try {
-      await relay.chat.completions.create({ model, max_tokens: 5, messages: [{ role: 'user', content: 'hi' }] });
-      results.push({ model, ok: true });
-    } catch (err) {
-      results.push({ model, ok: false, error: err.message });
-    }
-  }
-  res.json(results);
 });
 
 // === 启动 ===
