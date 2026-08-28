@@ -805,6 +805,99 @@ app.post('/api/games/draw-guess/guess', async (req, res) => {
   }
 });
 
+// === 共读 ===
+
+app.get('/api/nook/books', async (req, res) => {
+  const { data, error } = await supabase
+    .from('nook_books').select('*').order('created_at', { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.get('/api/nook/books/:id/chapters', async (req, res) => {
+  const { data, error } = await supabase
+    .from('nook_chapters').select('chapter_number, title')
+    .eq('book_id', req.params.id).order('chapter_number', { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.get('/api/nook/books/:id/chapters/:num', async (req, res) => {
+  const { data, error } = await supabase
+    .from('nook_chapters').select('*')
+    .eq('book_id', req.params.id).eq('chapter_number', req.params.num).single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.get('/api/nook/progress/:bookId', async (req, res) => {
+  const { data, error } = await supabase
+    .from('nook_progress').select('*').eq('book_id', req.params.bookId);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/api/nook/progress', async (req, res) => {
+  const { book_id, who, chapter, paragraph } = req.body;
+  if (!book_id || !who || chapter === undefined || paragraph === undefined) {
+    return res.status(400).json({ error: 'missing fields' });
+  }
+  const { data, error } = await supabase
+    .from('nook_progress')
+    .upsert({ book_id, who, chapter, paragraph, updated_at: new Date().toISOString() }, { onConflict: 'book_id,who' })
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.get('/api/nook/annotations/:bookId/:chapter', async (req, res) => {
+  const { data: annotations, error } = await supabase
+    .from('nook_annotations').select('*')
+    .eq('book_id', req.params.bookId).eq('chapter', req.params.chapter)
+    .order('created_at', { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+
+  const ids = annotations.map(a => a.id);
+  let floors = [];
+  if (ids.length) {
+    const { data: floorRows, error: floorError } = await supabase
+      .from('nook_annotation_floors').select('*')
+      .in('annotation_id', ids).order('created_at', { ascending: true });
+    if (floorError) return res.status(500).json({ error: floorError.message });
+    floors = floorRows;
+  }
+
+  const result = annotations.map(a => ({
+    ...a,
+    floors: floors.filter(f => f.annotation_id === a.id)
+  }));
+  res.json(result);
+});
+
+app.post('/api/nook/annotations', async (req, res) => {
+  const { book_id, chapter, anchor_para, anchor_quote, who } = req.body;
+  if (!book_id || chapter === undefined || anchor_para === undefined || !anchor_quote || !who) {
+    return res.status(400).json({ error: 'missing fields' });
+  }
+  const { data, error } = await supabase
+    .from('nook_annotations')
+    .insert({ book_id, chapter, anchor_para, anchor_quote, who })
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ...data, floors: [] });
+});
+
+app.post('/api/nook/annotations/:id/floors', async (req, res) => {
+  const { who, text } = req.body;
+  if (!who || !text) return res.status(400).json({ error: 'missing fields' });
+  const { data, error } = await supabase
+    .from('nook_annotation_floors')
+    .insert({ annotation_id: req.params.id, who, text })
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
 // === 启动 ===
 
 const PORT = process.env.PORT || 3000;
