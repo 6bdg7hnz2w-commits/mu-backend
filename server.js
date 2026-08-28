@@ -56,6 +56,10 @@ const MODEL_MAP = {
   'deepseek-pro': 'deepseek-v4-pro'
 };
 
+// 你画我猜、日记生成用这个：不需要走聊天用的 thinking 变体，
+// 用普通的 sonnet-4-6。
+const RELAY_DEFAULT_MODEL = 'claude-sonnet-4-6';
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: '沐在这里' });
 });
@@ -542,7 +546,7 @@ async function generateDiaryContent() {
   const userContent = transcript ? `今天的对话记录：\n${transcript}` : '今天没有对话记录。';
 
   const response = await relay.chat.completions.create({
-    model: process.env.DIARY_MODEL,
+    model: RELAY_DEFAULT_MODEL,
     max_tokens: 4096,
     messages: [
       { role: 'system', content: DIARY_SYSTEM_PROMPT },
@@ -866,7 +870,7 @@ app.post('/api/games/draw-guess/guess', async (req, res) => {
   if (!image) return res.status(400).json({ error: 'missing image' });
   try {
     const response = await relay.chat.completions.create({
-      model: MODEL_MAP.sonnet,
+      model: RELAY_DEFAULT_MODEL,
       max_tokens: 300,
       messages: [
         { role: 'system', content: '你在玩"你画我猜"，对方画了一幅简笔画，请你猜猜画的是什么。用JSON格式回复，包含guess(你猜的词，尽量简短)和reason(简短说明你为什么这么猜，一两句话，语气活泼一点)两个字段，不要输出JSON以外的任何文字。' },
