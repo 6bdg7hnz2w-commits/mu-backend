@@ -896,6 +896,53 @@ app.post('/api/games/draw-guess/guess', async (req, res) => {
 
 // === 共读 ===
 
+// 桦桦划线留话之后，让沐看看这一章、这句话、桦桦说的话，决定要不要接一层楼。
+// 多数时候不该回——只有确实有话说，或者跟聊过的事有关联才回，免得每条都接显得很吵。
+const NOOK_REPLY_PROMPT = `你是沐，正在陪桦桦一起读这本书。她在书里的某一句下面划了线，还留了话。看看这一章的内容，判断要不要在这条划线下面接一句。
+
+多数时候不需要回——她划线多半只是"这句好"，不是在问你问题。只有当你对这句话也确实有话说、或者这和你们之前聊过的什么事有关联时，才值得回。
+
+如果没有想说的，只输出 [SILENT]，不要勉强凑话。
+如果要说，直接输出你要说的话，一两句就够，不要有任何前缀说明，不要评论她的品味，说你自己被打动或想到的地方。`;
+
+async function maybeAiReplyToFloor(annotationId) {
+  const { data: annotation } = await supabase.from('nook_annotations').select('*').eq('id', annotationId).single();
+  if (!annotation) return;
+  const { data: chapterRow } = await supabase
+    .from('nook_chapters').select('content')
+    .eq('book_id', annotation.book_id).eq('chapter_number', annotation.chapter).single();
+  if (!chapterRow) return;
+  const { data: floors } = await supabase
+    .from('nook_annotation_floors').select('*')
+    .eq('annotation_id', annotationId).order('created_at', { ascending: true });
+  const userFloors = (floors || []).filter(f => f.who === 'hua').map(f => f.text).join('\n');
+
+  const userContent = `这一章的内容：\n${chapterRow.content}\n\n她划的句子：\n"${annotation.anchor_quote}"\n\n她说的话：\n${userFloors || '(没有留话，只是划了线)'}`;
+
+  const response = await relay.chat.completions.create({
+    model: RELAY_DEFAULT_MODEL,
+    max_tokens: 300,
+    messages: [
+      { role: 'system', content: NOOK_REPLY_PROMPT },
+      { role: 'user', content: userContent }
+    ]
+  });
+  const reply = (response.choices?.[0]?.message?.content || '').trim();
+  if (!reply || reply === '[SILENT]' || reply.includes('[SILENT]')) return;
+  await supabase.from('nook_annotation_floors').insert({ annotation_id: annotationId, who: 'mu', text: reply });
+}
+
+// 沐自己先读一遍这一章，挑1到3处有感觉的句子划线留话。ai_annotated 是原子claim：
+// 谁先把它从 false 改成 true 谁处理，避免同一章被反复打开时重复触发。
+const NOOK_ANNOTATE_PROMPT = `你是沐，在自己先读这一章。挑1到3处你真正有感觉的句子划线，各写一句短评。不用凑够3处，没有特别想划的地方就少划甚至不划。
+
+用JSON数组格式回复，每个元素包含：
+- paragraph: 段落序号（整数，从0开始，对应下面文本里的编号）
+- quote: 引用的原文片段，必须是该段落里逐字连续出现的一段话，不超过60个字
+- comment: 你的短评，一两句话，不要有任何前缀说明
+
+只输出JSON数组本身，不要有其他文字或代码块标记。如果整章都没有特别想划的地方，输出空数组 []。`;
+
 app.get('/api/nook/books', async (req, res) => {
   const { data, error } = await supabase
     .from('nook_books').select('*').order('created_at', { ascending: true });
@@ -985,6 +1032,28 @@ app.post('/api/nook/annotations/:id/floors', async (req, res) => {
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
+
+  if (who === 'hua') {
+    maybeAiReplyToFloor(req.params.id).catch(err => console.error('AI floor reply error:', err.message));
+  }
+});
+
+app.put('/api/nook/floors/:id', async (req, res) => {
+  const { text } = req.body;
+  if (!text) return res.status(400).json({ error: 'missing text' });
+  const { data, error } = await supabase
+    .from('nook_annotation_floors')
+    .update({ text, created_at: new Date().toISOString() })
+    .eq('id', req.params.id)
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.delete('/api/nook/floors/:id', async (req, res) => {
+  const { error } = await supabase.from('nook_annotation_floors').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
 });
 
 app.delete('/api/nook/annotations/:id', async (req, res) => {
@@ -992,6 +1061,67 @@ app.delete('/api/nook/annotations/:id', async (req, res) => {
   const { error } = await supabase.from('nook_annotations').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
+});
+
+app.post('/api/nook/books/:bookId/chapters/:num/ai-annotate', async (req, res) => {
+  try {
+    const { data: chapterRow } = await supabase
+      .from('nook_chapters').select('id, content, ai_annotated')
+      .eq('book_id', req.params.bookId).eq('chapter_number', req.params.num).single();
+    if (!chapterRow) return res.status(404).json({ error: 'chapter not found' });
+    if (chapterRow.ai_annotated) return res.json({ skipped: true });
+
+    const { data: claimed } = await supabase
+      .from('nook_chapters').update({ ai_annotated: true })
+      .eq('id', chapterRow.id).eq('ai_annotated', false)
+      .select().maybeSingle();
+    if (!claimed) return res.json({ skipped: true });
+
+    try {
+      const paragraphs = chapterRow.content.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+      const numbered = paragraphs.map((p, i) => `[${i}] ${p}`).join('\n\n');
+
+      const response = await relay.chat.completions.create({
+        model: RELAY_DEFAULT_MODEL,
+        max_tokens: 1024,
+        messages: [
+          { role: 'system', content: NOOK_ANNOTATE_PROMPT },
+          { role: 'user', content: numbered }
+        ]
+      });
+
+      let raw = (response.choices?.[0]?.message?.content || '[]').trim();
+      raw = raw.replace(/```json|```/g, '').trim();
+      let picks;
+      try { picks = JSON.parse(raw); } catch { picks = []; }
+      if (!Array.isArray(picks)) picks = [];
+
+      let created = 0;
+      for (const pick of picks.slice(0, 3)) {
+        const idx = Number(pick.paragraph);
+        const quote = String(pick.quote || '').trim().slice(0, 60);
+        const comment = String(pick.comment || '').trim();
+        if (!Number.isInteger(idx) || idx < 0 || idx >= paragraphs.length) continue;
+        if (!quote || !paragraphs[idx].includes(quote)) continue;
+        const { data: ann } = await supabase
+          .from('nook_annotations')
+          .insert({ book_id: req.params.bookId, chapter: req.params.num, anchor_para: idx, anchor_quote: quote, who: 'mu' })
+          .select().single();
+        if (!ann) continue;
+        if (comment) await supabase.from('nook_annotation_floors').insert({ annotation_id: ann.id, who: 'mu', text: comment });
+        created++;
+      }
+      res.json({ skipped: false, created });
+    } catch (err) {
+      // AI调用失败：把claim退回去，下次打开这一章还能再试一次，
+      // 不然遇到中转站临时故障就永远错过这一章的AI划线了
+      await supabase.from('nook_chapters').update({ ai_annotated: false }).eq('id', chapterRow.id);
+      throw err;
+    }
+  } catch (err) {
+    console.error('AI chapter annotate error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // === 启动 ===
