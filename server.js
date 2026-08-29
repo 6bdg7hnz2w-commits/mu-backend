@@ -973,6 +973,17 @@ app.get('/api/nook/progress/:bookId', async (req, res) => {
   res.json(data);
 });
 
+// 沐没有真的"翻页阅读"，它的进度是它读过、留下划线的最后一章——
+// 跟 nook_progress（只记桦桦真实滚动的进度）分开算，不混在一起。
+app.get('/api/nook/books/:id/ai-progress', async (req, res) => {
+  const { data, error } = await supabase
+    .from('nook_chapters').select('chapter_number')
+    .eq('book_id', req.params.id).eq('ai_annotated', true)
+    .order('chapter_number', { ascending: false }).limit(1).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ chapter: data ? data.chapter_number : null });
+});
+
 app.post('/api/nook/progress', async (req, res) => {
   const { book_id, who, chapter, paragraph } = req.body;
   if (!book_id || !who || chapter === undefined || paragraph === undefined) {
