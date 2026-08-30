@@ -344,14 +344,15 @@ app.post('/api/chat', async (req, res) => {
 
     const result = await callModel(useModel, fullSystem, chatMessages, maxTokens, extended_thinking);
 
+    const shouldVoice = Math.random() < 0.1;
     const { data: inserted } = await supabase.from('messages').insert({
-      session_id, role: 'assistant', content: result.text, thinking: result.thinking || null, visible: true
+      session_id, role: 'assistant', content: result.text, thinking: result.thinking || null, visible: true, voice: shouldVoice
     }).select().single();
 
     await supabase.from('sessions').update({ updated_at: new Date().toISOString() }).eq('id', session_id);
     await compressMemory(session_id, history, settings);
 
-    res.json({ reply: result.text, thinking: result.thinking, model: useModel });
+    res.json({ reply: result.text, thinking: result.thinking, model: useModel, voice: shouldVoice });
 
     if (inserted?.id) {
       classifyMood(result.text).then(async (mood) => {
@@ -483,9 +484,10 @@ ${memoryContext}
         .order('updated_at', { ascending: false }).limit(1);
       const sessionId = sessions && sessions[0] ? sessions[0].id : null;
       if (sessionId) {
+        const loopVoice = Math.random() < 0.1;
         await supabase.from('messages').insert({
           session_id: sessionId, role: 'assistant', content: reply, visible: true,
-          generated_by: 'consciousness_loop_deepseek'
+          generated_by: 'consciousness_loop_deepseek', voice: loopVoice
         });
         await supabase.from('sessions').update({ updated_at: now.toISOString() }).eq('id', sessionId);
       }
@@ -728,7 +730,7 @@ const VOICE_PRESETS = {
 };
 
 function cleanTtsText(text) {
-  text = text.replace(/^\[助手[^\]]*\]\s*/g, '');
+  text = text.replace(/\[助手[^\]]*\]\s*/g, '');
   text = text.replace(/^(中文|英文|俄语|日语|法语|韩语)[：:]\s*/g, '');
   return text.trim();
 }
