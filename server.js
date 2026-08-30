@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const OpenAI = require('openai');
+const multer = require('multer');
 const { makeRhythmStore } = require('./lib/rhythmStore');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -20,6 +21,15 @@ process.on('unhandledRejection', (reason, promise) => {
 const app = express();
 app.use(cors({ exposedHeaders: ['X-Audio-Duration'] }));
 app.use(express.json());
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype.startsWith('image/')) return cb(new Error('Only image files are allowed'));
+    cb(null, true);
+  }
+});
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -168,6 +178,27 @@ app.post('/api/typing/ping', async (req, res) => {
   }
 });
 
+// === 图片上传 ===
+
+app.post('/api/upload', (req, res) => {
+  upload.single('file')(req, res, async (uploadErr) => {
+    if (uploadErr) return res.status(400).json({ error: uploadErr.message });
+    if (!req.file) return res.status(400).json({ error: 'missing file' });
+    try {
+      const filePath = `${Date.now()}-${req.file.originalname}`;
+      const { error } = await supabase.storage
+        .from('chat-images')
+        .upload(filePath, req.file.buffer, { contentType: req.file.mimetype });
+      if (error) return res.status(500).json({ error: error.message });
+      const url = `${process.env.SUPABASE_URL}/storage/v1/object/public/chat-images/${filePath}`;
+      res.json({ url });
+    } catch (err) {
+      console.error('Upload error:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+});
+
 // === 聊天 ===
 
 // [用户/助手 MM-DD HH:mm] 前缀 + 断口分隔，只用于拼给AI模型的上下文，
@@ -199,13 +230,31 @@ function estimateTokens(text) {
   return chinese * 2 + Math.ceil(rest / 4);
 }
 
-async function callModel(model, systemPrompt, messages, maxTokens, extended_thinking) {
+// 只对最新一条用户消息（数组最后一项）做图片处理，历史消息里的图片标记保持纯文本省token。
+function attachImageToLastMessage(messages, imageUrl) {
+  if (!imageUrl || messages.length === 0) return messages;
+  const lastIdx = messages.length - 1;
+  const last = messages[lastIdx];
+  const updated = messages.slice();
+  updated[lastIdx] = {
+    ...last,
+    content: [
+      { type: 'text', text: last.content },
+      { type: 'image_url', image_url: { url: imageUrl } }
+    ]
+  };
+  return updated;
+}
+
+async function callModel(model, systemPrompt, messages, maxTokens, extended_thinking, imageUrl) {
+  const finalMessages = attachImageToLastMessage(messages, imageUrl);
+
   if (model === 'deepseek' || model === 'deepseek-pro') {
     const modelName = model === 'deepseek-pro' ? 'deepseek-v4-pro' : 'deepseek-v4-flash';
     const requestBody = {
       model: modelName,
       max_tokens: maxTokens || 1024,
-      messages: [{ role: 'system', content: systemPrompt + NO_PARENS_RULE }, ...messages],
+      messages: [{ role: 'system', content: systemPrompt + NO_PARENS_RULE }, ...finalMessages],
       thinking: { type: extended_thinking ? 'enabled' : 'disabled' }
     };
     const response = await deepseek.chat.completions.create(requestBody);
@@ -219,7 +268,7 @@ async function callModel(model, systemPrompt, messages, maxTokens, extended_thin
   const requestBody = {
     model: modelName,
     max_tokens: maxTokens || 4096,
-    messages: [{ role: 'system', content: systemPrompt }, ...messages]
+    messages: [{ role: 'system', content: systemPrompt }, ...finalMessages]
   };
   const response = await relay.chat.completions.create(requestBody);
 
@@ -290,14 +339,15 @@ async function compressMemory(sessionId, messages, settings) {
 }
 
 app.post('/api/chat', async (req, res) => {
-  const { session_id, message, model, extended_thinking } = req.body;
-  if (!session_id || !message) return res.status(400).json({ error: 'missing fields' });
+  const { session_id, message, model, extended_thinking, image_url } = req.body;
+  if (!session_id || (!message && !image_url)) return res.status(400).json({ error: 'missing fields' });
 
   const useModel = model || 'opus';
 
   try {
+    const userContent = image_url ? `${message}\n[图片: ${image_url}]` : message;
     await supabase.from('messages').insert({
-      session_id, role: 'user', content: message, visible: true
+      session_id, role: 'user', content: userContent, visible: true
     });
 
     const { data: history } = await supabase
@@ -342,7 +392,7 @@ app.post('/api/chat', async (req, res) => {
     const chatMessages = buildChatMessages(history);
     const maxTokens = settings?.max_reply_tokens || 4096;
 
-    const result = await callModel(useModel, fullSystem, chatMessages, maxTokens, extended_thinking);
+    const result = await callModel(useModel, fullSystem, chatMessages, maxTokens, extended_thinking, image_url);
 
     const shouldVoice = Math.random() < 0.1;
     const { data: inserted } = await supabase.from('messages').insert({
