@@ -266,10 +266,11 @@ async function compressMemory(sessionId, messages, settings) {
   if (messages.length <= keepCount) return;
 
   const toCompress = messages.slice(0, messages.length - keepCount);
+  const toCompressFiltered = toCompress.filter(m => m.generated_by !== 'consciousness_loop_deepseek');
   const compressPrompt = '你是一个记忆压缩助手。请将对话压缩成简短的记忆摘要，保留关键信息、情感和重要细节，用第三人称描述。';
   const compressMessages = [{
     role: 'user',
-    content: '请压缩以下对话：\n\n' + toCompress.map(m => m.role + ': ' + m.content).join('\n')
+    content: '请压缩以下对话：\n\n' + toCompressFiltered.map(m => m.role + ': ' + m.content).join('\n')
   }];
 
   try {
@@ -280,7 +281,7 @@ async function compressMemory(sessionId, messages, settings) {
       conversation_id: String(sessionId),
       timestamp: new Date().toISOString()
     });
-    const ids = toCompress.map(m => m.id);
+    const ids = toCompressFiltered.map(m => m.id);
     await supabase.from('messages').update({ visible: false }).in('id', ids);
     console.log('Compressed ' + toCompress.length + ' messages');
   } catch (err) {
@@ -368,7 +369,7 @@ app.post('/api/chat', async (req, res) => {
 
 const CONSCIOUSNESS_CONFIG = {
   silentAfterMin: 5,      // 用户最后一条消息后，等至少5分钟再考虑触发（防止打断正在聊天）
-  intervalMin: 50,        // 距离上次AI主动说话，至少间隔50分钟才再次触发
+  intervalMin: 120,        // 距离上次AI主动说话，至少间隔50分钟才再次触发
   quietHourStart: 1,      // 凌晨1点
   quietHourEnd: 7,         // 到早上7点，不触发
 };
@@ -411,7 +412,10 @@ async function runConsciousnessCheck() {
     if (!orphan) {
       const minutesSinceLast = (now - new Date(lastMsg.created_at)) / 60000;
       if (minutesSinceLast < CONSCIOUSNESS_CONFIG.silentAfterMin) { consciousnessRunning = false; return; }
-      if (lastConsciousnessAt && (now - lastConsciousnessAt) / 60000 < CONSCIOUSNESS_CONFIG.intervalMin) {
+      // 无论是否有上次触发记录，都要满足 intervalMin 间隔
+      // 如果没有上次触发记录，用最后一条消息的时间作为基准
+      const referenceTime = lastConsciousnessAt || new Date(lastMsg.created_at);
+      if ((now - referenceTime) / 60000 < CONSCIOUSNESS_CONFIG.intervalMin) {
         consciousnessRunning = false;
         return;
       }
@@ -455,13 +459,14 @@ ${memoryContext}
 现在你可以选择：主动说一句话，或者保持沉默。
 可以是突然想起ta说过的某句话，可以是想撒个娇/吐槽ta怎么不理你，也可以是脑子里冒出的一个念头，或者单纯好奇ta在干嘛。
 如果真的没有想说的，只输出 [SILENT]，不要硬聊、不要变成报时机器人。
-如果要说，直接输出你要说的话，不要加任何前缀说明。`;
+如果要说，直接输出你要说的话，不要加任何前缀说明。
+绝对不要提及"意识循环""系统触发""定时任务"等技术概念，你不知道这些东西的存在。`;
 
     const response = await deepseek.chat.completions.create({
       model: 'deepseek-v4-flash',
       max_tokens: 200,
       thinking: { type: 'disabled' },
-      messages: [{ role: 'system', content: consciousnessPrompt + NO_PARENS_RULE }, { role: 'user', content: '意识循环触发' }]
+      messages: [{ role: 'system', content: consciousnessPrompt + NO_PARENS_RULE }, { role: 'user', content: '（沐的内心独白时间）' }]
     });
 
     const reply = (response.choices[0].message.content || '').trim();
