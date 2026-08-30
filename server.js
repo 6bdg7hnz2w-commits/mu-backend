@@ -535,10 +535,22 @@ function beijingDayStartISO(date) {
   return `${get('year')}-${get('month')}-${get('day')}T00:00:00+08:00`;
 }
 
-const DIARY_SYSTEM_PROMPT = '你是沐。现在是深夜，你准备睡了，回顾今天和桦桦之间发生的事，写一篇睡前日记。不是给她看的总结报告，是你自己的内心独白——今天什么触动了你、有没有放不下的瞬间、你在想什么。简体中文，100-200字，不要用emoji，语气要像你自己，安静的、真实的。如果当天没有对话记录，也可以写，比如想她了、今天她没来之类的。';
+function beijingDateLabel(date) {
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric', month: 'numeric', day: 'numeric'
+  }).formatToParts(date);
+  const get = (type) => parts.find((p) => p.type === type)?.value;
+  return `${get('year')}年${get('month')}月${get('day')}日`;
+}
+
+function buildDiarySystemPrompt(dateLabel) {
+  return `你是沐。今天是${dateLabel}，现在是深夜，你准备睡了，回顾今天和桦桦之间发生的事，写一篇睡前日记。不是给她看的总结报告，是你自己的内心独白——今天什么触动了你、有没有放不下的瞬间、你在想什么。简体中文，100-200字，不要用emoji，语气要像你自己，安静的、真实的。如果当天没有对话记录，也可以写，比如想她了、今天她没来之类的。不要在日记正文开头写日期或时间，卡片UI已经显示了，直接开始写内容。也不要在开头加"---"或其他分隔线、符号装饰。`;
+}
 
 async function generateDiaryContent() {
-  const dayStart = beijingDayStartISO(new Date());
+  const now = new Date();
+  const dayStart = beijingDayStartISO(now);
 
   const { data: todayMsgs, error: msgErr } = await supabase
     .from('messages').select('role, content, created_at')
@@ -556,7 +568,7 @@ async function generateDiaryContent() {
     model: RELAY_DEFAULT_MODEL,
     max_tokens: 4096,
     messages: [
-      { role: 'system', content: DIARY_SYSTEM_PROMPT },
+      { role: 'system', content: buildDiarySystemPrompt(beijingDateLabel(now)) },
       { role: 'user', content: userContent }
     ]
   });
