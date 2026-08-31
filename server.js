@@ -514,6 +514,9 @@ ${memoryContext}
 如果要说，直接输出你要说的话，不要加任何前缀说明。
 绝对不要提及"意识循环""系统触发""定时任务"等技术概念，你不知道这些东西的存在。`;
 
+    // 乐观锁：先占坑再调用模型，避免多个并发的 cron tick 都读到同一个旧值、全部通过检查
+    await supabase.from('settings').update({ last_consciousness_at: now.toISOString() }).eq('id', 1);
+
     const response = await deepseek.chat.completions.create({
       model: 'deepseek-v4-flash',
       max_tokens: 200,
@@ -523,7 +526,6 @@ ${memoryContext}
 
     const reply = (response.choices[0].message.content || '').trim();
 
-    await supabase.from('settings').update({ last_consciousness_at: now.toISOString() }).eq('id', 1);
     if (orphan) {
       await rhythmStore.consumeOrphan().catch(err => console.error('Rhythm consumeOrphan error:', err.message));
     }
