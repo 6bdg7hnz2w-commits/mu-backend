@@ -421,8 +421,7 @@ app.post('/api/chat', async (req, res) => {
 const CONSCIOUSNESS_CONFIG = {
   silentAfterMin: 5,      // 用户最后一条消息后，等至少5分钟再考虑触发（防止打断正在聊天）
   intervalMin: 120,        // 距离上次AI主动说话，至少间隔50分钟才再次触发
-  quietHourStart: 1,      // 凌晨1点
-  quietHourEnd: 7,         // 到早上7点，不触发
+  quietHours: { start: 0, end: 7 }, // 北京时间凌晨0点到早上7点，宵禁不触发
 };
 
 let consciousnessRunning = false;
@@ -432,8 +431,10 @@ async function runConsciousnessCheck() {
   consciousnessRunning = true;
   try {
     const now = new Date();
-    const hour = now.getHours();
-    if (hour >= CONSCIOUSNESS_CONFIG.quietHourStart && hour < CONSCIOUSNESS_CONFIG.quietHourEnd) {
+    const beijingHour = Number(new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Shanghai', hour: 'numeric', hourCycle: 'h23',
+    }).format(now));
+    if (beijingHour >= CONSCIOUSNESS_CONFIG.quietHours.start && beijingHour < CONSCIOUSNESS_CONFIG.quietHours.end) {
       consciousnessRunning = false;
       return;
     }
