@@ -19,7 +19,10 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 const app = express();
-app.use(cors({ exposedHeaders: ['X-Audio-Duration'] }));
+// 只允许自己的前端跨域调用。Render 上可以用 ALLOWED_ORIGINS（逗号分隔）覆盖默认值。
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://mu-frontend.onrender.com,http://localhost:5173')
+  .split(',').map(s => s.trim()).filter(Boolean);
+app.use(cors({ origin: ALLOWED_ORIGINS, exposedHeaders: ['X-Audio-Duration'] }));
 app.use(express.json());
 
 const upload = multer({
@@ -1204,6 +1207,100 @@ app.post('/api/nook/books/:bookId/chapters/:num/ai-annotate', async (req, res) =
   } catch (err) {
     console.error('AI chapter annotate error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// === 沐 (CC)：转发到 VPS 上的 Claude Code 中转 ===
+// BRIDGE_TOKEN 只在这里用，永远不下发给浏览器；浏览器这边用 APP_PASSCODE 鉴权。
+
+function requireAppKey(req, res, next) {
+  const expected = process.env.APP_PASSCODE;
+  if (!expected) return res.status(503).json({ error: 'APP_PASSCODE not configured' });
+  const got = (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  // 先各自哈希成等长再比较，timingSafeEqual 要求长度一致，也避免泄露口令长度
+  const a = crypto.createHash('sha256').update(got).digest();
+  const b = crypto.createHash('sha256').update(expected).digest();
+  if (!got || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: 'unauthorized' });
+  next();
+}
+
+function bridgeConfig() {
+  const url = (process.env.BRIDGE_URL || '').replace(/\/+$/, '');
+  const token = process.env.BRIDGE_TOKEN;
+  return url && token ? { url, token } : null;
+}
+
+app.post('/api/cc/send', requireAppKey, async (req, res) => {
+  const bridge = bridgeConfig();
+  if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+  const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+  if (!text) return res.status(400).json({ error: 'text required' });
+  try {
+    const r = await fetch(`${bridge.url}/send`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+      signal: AbortSignal.timeout(15000)
+    });
+    if (!r.ok) {
+      console.error('CC bridge send failed:', r.status);
+      return res.status(502).json({ error: `bridge ${r.status}` });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('CC bridge send error:', err.message);
+    res.status(502).json({ error: 'bridge unreachable' });
+  }
+});
+
+// SSE 透传：bridge 的字节原样转给浏览器，不做缓冲。
+app.get('/api/cc/events', requireAppKey, async (req, res) => {
+  const bridge = bridgeConfig();
+  if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+
+  const upstream = new AbortController();
+  let heartbeat;
+  res.on('close', () => { clearInterval(heartbeat); upstream.abort(); });
+
+  let r;
+  try {
+    r = await fetch(`${bridge.url}/events`, {
+      headers: { 'Authorization': `Bearer ${bridge.token}`, 'Accept': 'text/event-stream' },
+      signal: upstream.signal
+    });
+  } catch (err) {
+    if (!upstream.signal.aborted) console.error('CC bridge events error:', err.message);
+    if (!res.headersSent && !res.writableEnded) res.status(502).json({ error: 'bridge unreachable' });
+    return;
+  }
+  if (!r.ok || !r.body) {
+    upstream.abort();
+    console.error('CC bridge events failed:', r.status);
+    return res.status(502).json({ error: `bridge ${r.status}` });
+  }
+
+  res.status(200).set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders();
+
+  // 心跳防止 Render/代理把空闲连接掐掉；只在上一块以换行结尾时插入，避免切断一行 JSON
+  let atLineStart = true;
+  heartbeat = setInterval(() => { if (atLineStart) res.write(': ping\n\n'); }, 25000);
+
+  try {
+    for await (const chunk of r.body) {
+      res.write(chunk);
+      atLineStart = chunk.length > 0 && chunk[chunk.length - 1] === 0x0a;
+    }
+  } catch (err) {
+    if (!upstream.signal.aborted) console.error('CC bridge stream error:', err.message);
+  } finally {
+    clearInterval(heartbeat);
+    res.end();
   }
 });
 
