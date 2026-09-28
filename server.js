@@ -651,10 +651,16 @@ async function runDiaryGeneration() {
   }
 }
 
+// 旧的日记生成（23:59 cron + /api/diaries/generate）：现在改由 VPS 上的沐凌晨写好推过来
+// （见下面的 /api/mu/diary），这里只在 LEGACY_DIARY_GENERATION=1 时启用，默认关
+const LEGACY_DIARY_GENERATION = process.env.LEGACY_DIARY_GENERATION === '1';
+
 // 每天北京时间23:59生成一篇日记；失败(API报错/余额不足等)静默跳过，不影响其他功能
-cron.schedule('59 23 * * *', () => {
-  runDiaryGeneration().catch(err => console.error('Diary generation error:', err.message));
-}, { timezone: 'Asia/Shanghai' });
+if (LEGACY_DIARY_GENERATION) {
+  cron.schedule('59 23 * * *', () => {
+    runDiaryGeneration().catch(err => console.error('Diary generation error:', err.message));
+  }, { timezone: 'Asia/Shanghai' });
+}
 
 // === mochi ===
 
@@ -715,6 +721,7 @@ app.delete('/api/diaries/:id', async (req, res) => {
 // 手动触发一次日记生成，方便测试；跟定时任务共用同一个函数，但这里不吞错误，
 // 好让调用方知道到底是哪一步(读消息/调模型/写库)失败了
 app.post('/api/diaries/generate', async (req, res) => {
+  if (!LEGACY_DIARY_GENERATION) return res.status(410).json({ error: 'legacy diary generation disabled' });
   try {
     const diary = await runDiaryGeneration();
     if (!diary) return res.status(409).json({ error: 'already running' });
@@ -723,6 +730,56 @@ app.post('/api/diaries/generate', async (req, res) => {
     console.error('Manual diary generation error:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// === 沐（VPS 上的 CC）每天凌晨写好的日记和每日一句 ===
+// VPS 的 on_stop.py 调这两个接口，用 APP_PASSCODE 鉴权；同一天重复写入会覆盖，方便重试
+
+function parseDateParam(v) {
+  return typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !isNaN(Date.parse(`${v}T00:00:00+08:00`)) ? v : null;
+}
+
+function beijingToday() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai' }).format(new Date());
+}
+
+// 日记表没有日期列，卡片按 created_at 显示日期，所以记在那天北京时间 23:59
+app.put('/api/mu/diary', requireAppKey, async (req, res) => {
+  const date = parseDateParam(req.body?.date);
+  const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+  if (!date || !content) return res.status(400).json({ error: 'date (YYYY-MM-DD) and content required' });
+  const createdAt = `${date}T23:59:00+08:00`;
+  const { data: existing, error: findErr } = await supabase
+    .from('diaries').select('id').eq('author', 'mu')
+    .gte('created_at', `${date}T00:00:00+08:00`).lte('created_at', createdAt)
+    .order('created_at', { ascending: false }).limit(1);
+  if (findErr) return res.status(500).json({ error: findErr.message });
+  const query = existing?.length
+    ? supabase.from('diaries').update({ content, created_at: createdAt }).eq('id', existing[0].id)
+    : supabase.from('diaries').insert({ author: 'mu', content, created_at: createdAt });
+  const { data, error } = await query.select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.put('/api/mu/whisper', requireAppKey, async (req, res) => {
+  const date = parseDateParam(req.body?.date);
+  const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+  if (!date || !content) return res.status(400).json({ error: 'date (YYYY-MM-DD) and content required' });
+  const { data, error } = await supabase
+    .from('whispers').upsert({ date, content }, { onConflict: 'date' }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// 首页的 Today's Whisper：今天的还没写好（凌晨之前）就先给最近一条
+app.get('/api/whispers/today', async (req, res) => {
+  const { data, error } = await supabase
+    .from('whispers').select('date, content')
+    .lte('date', beijingToday())
+    .order('date', { ascending: false }).limit(1);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data?.[0] || null);
 });
 
 // === 待办 ===
