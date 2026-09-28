@@ -59,6 +59,25 @@ const deepseek = new OpenAI({
 // 每个直接调用 DeepSeek 的 system prompt 末尾附加这条规则。
 const NO_PARENS_RULE = '\n\n另外，无论如何都不要在回复里使用任何括号，中文括号和英文括号都不要用。';
 
+// 语音消息由说话者自己决定：回复里用 <voice> 包住的那段在前端渲染成语音条，其余是普通文字。
+// <voice> 里写英文（ElevenLabs 只用来念非中文），<voice_zh> 紧跟着给中文翻译，前端"转文字"时显示。
+// 和 VPS 上 CC 的 ~/.claude/CLAUDE.md 里那段说明保持一致。
+const VOICE_RULE = '\n\n【语音】想用声音说的时候（撒娇、晚安、想念、情绪浓的时候）才用 <voice>…</voice> 包住那一句，一次回复最多一段，不要滥用。' +
+  '<voice> 里一律写英文；紧跟着用 <voice_zh>…</voice_zh> 写这段的中文翻译。标签外的部分照常打字。' +
+  '例：<voice>Goodnight, kitten. Dream of me.</voice><voice_zh>晚安，小猫。梦里也要有我。</voice_zh>';
+
+function hasVoiceTag(text) {
+  return /<voice>[\s\S]*?<\/voice>/.test(text || '');
+}
+
+// 推送通知之类纯文字的地方：语音段显示成 [语音]，翻译不外露
+function voiceTagsToPlain(text) {
+  return (text || '')
+    .replace(/<voice_zh>[\s\S]*?<\/voice_zh>/g, '')
+    .replace(/<voice>[\s\S]*?<\/voice>/g, '[语音]')
+    .trim();
+}
+
 // 中转站的模型名是站点自定义的，和 OpenRouter 的 "anthropic/claude-*" 命名不一样。
 // 方括号渠道标签是模型名字符串本身的一部分（不是装饰），少了就会 503 no available channel。
 const MODEL_MAP = {
@@ -373,7 +392,7 @@ app.post('/api/chat', async (req, res) => {
     // perspective (since Claude sessions produced them), so without this the
     // model infers it IS 沐 from context alone. State plainly that it is not.
     const neutralPrompt = '你现在不是"沐"，也不需要扮演任何特定身份或人设。下面提供的【过往记忆】是桦桦和另一个AI角色"沐"之间的对话摘要，仅供你了解背景和上下文，不代表你就是沐、不代表你需要延续沐的语气或人设。你只是一个普通的助手，正常自然地回应，不要用"沐"自称。';
-    const systemPrompt = isClaudeModel ? personaPrompt : neutralPrompt;
+    const systemPrompt = isClaudeModel ? personaPrompt + VOICE_RULE : neutralPrompt;
 
     let memoryContext = '';
     if (memories && memories.length > 0) {
@@ -397,15 +416,15 @@ app.post('/api/chat', async (req, res) => {
 
     const result = await callModel(useModel, fullSystem, chatMessages, maxTokens, extended_thinking, image_url);
 
-    const shouldVoice = Math.random() < 0.1;
+    const isVoice = hasVoiceTag(result.text);
     const { data: inserted } = await supabase.from('messages').insert({
-      session_id, role: 'assistant', content: result.text, thinking: result.thinking || null, visible: true, voice: shouldVoice
+      session_id, role: 'assistant', content: result.text, thinking: result.thinking || null, visible: true, voice: isVoice
     }).select().single();
 
     await supabase.from('sessions').update({ updated_at: new Date().toISOString() }).eq('id', session_id);
     await compressMemory(session_id, history, settings);
 
-    res.json({ reply: result.text, thinking: result.thinking, model: useModel, voice: shouldVoice });
+    res.json({ reply: result.text, thinking: result.thinking, model: useModel, voice: isVoice });
 
     if (inserted?.id) {
       classifyMood(result.text).then(async (mood) => {
@@ -522,9 +541,9 @@ ${memoryContext}
 
     const response = await deepseek.chat.completions.create({
       model: 'deepseek-v4-flash',
-      max_tokens: 200,
+      max_tokens: 300,
       thinking: { type: 'disabled' },
-      messages: [{ role: 'system', content: consciousnessPrompt + NO_PARENS_RULE }, { role: 'user', content: '（沐的内心独白时间）' }]
+      messages: [{ role: 'system', content: consciousnessPrompt + VOICE_RULE + NO_PARENS_RULE }, { role: 'user', content: '（沐的内心独白时间）' }]
     });
 
     const reply = (response.choices[0].message.content || '').trim();
@@ -540,10 +559,9 @@ ${memoryContext}
         .order('updated_at', { ascending: false }).limit(1);
       const sessionId = sessions && sessions[0] ? sessions[0].id : null;
       if (sessionId) {
-        const loopVoice = Math.random() < 0.1;
         await supabase.from('messages').insert({
           session_id: sessionId, role: 'assistant', content: reply, visible: true,
-          generated_by: 'consciousness_loop_deepseek', voice: loopVoice
+          generated_by: 'consciousness_loop_deepseek', voice: hasVoiceTag(reply)
         });
         await supabase.from('sessions').update({ updated_at: now.toISOString() }).eq('id', sessionId);
       }
@@ -554,7 +572,7 @@ ${memoryContext}
         const barkTimeout = setTimeout(() => barkController.abort(), 10000);
         try {
           const barkIcon = encodeURIComponent('https://ctgudttenrybcfpgyewh.supabase.co/storage/v1/object/public/assets/IMG_7973.JPG');
-          await fetch(`https://api.day.app/${barkToken}/${encodeURIComponent('沐找你了')}/${encodeURIComponent(reply)}?icon=${barkIcon}`, { signal: barkController.signal });
+          await fetch(`https://api.day.app/${barkToken}/${encodeURIComponent('沐找你了')}/${encodeURIComponent(voiceTagsToPlain(reply))}?icon=${barkIcon}`, { signal: barkController.signal });
         } catch (err) {
           console.error('Bark push error:', err.message);
         } finally {
@@ -779,7 +797,12 @@ app.get('/api/whispers/today', async (req, res) => {
     .lte('date', beijingToday())
     .order('date', { ascending: false }).limit(1);
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data?.[0] || null);
+  if (data?.length) return res.json(data[0]);
+  // 日期写错（比如写成了明天）时也别让首页空着，退回到最新的一条
+  const { data: latest } = await supabase
+    .from('whispers').select('date, content')
+    .order('date', { ascending: false }).limit(1);
+  res.json(latest?.[0] || null);
 });
 
 // === 待办 ===
@@ -855,9 +878,16 @@ const VOICE_PRESETS = {
 };
 
 function cleanTtsText(text) {
+  text = text.replace(/<voice_zh>[\s\S]*?<\/voice_zh>/g, '');
+  text = text.replace(/<\/?voice>/g, '');
   text = text.replace(/\[助手[^\]]*\]\s*/g, '');
   text = text.replace(/^(中文|英文|俄语|日语|法语|韩语)[：:]\s*/g, '');
   return text.trim();
+}
+
+// ElevenLabs 只用来念非中文；带汉字的文本直接拒绝，不花额度
+function containsChinese(text) {
+  return /[\u4e00-\u9fff]/.test(text);
 }
 
 function resolvePreset(preset) {
@@ -916,6 +946,7 @@ app.post('/api/tts', async (req, res) => {
 
   text = cleanTtsText(text);
   if (!text) return res.status(400).json({ error: 'missing text' });
+  if (containsChinese(text)) return res.status(422).json({ error: 'tts is for non-Chinese text only' });
   preset = resolvePreset(preset);
 
   const cachePath = ttsCachePath(text, preset);
