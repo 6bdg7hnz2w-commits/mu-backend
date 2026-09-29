@@ -6,9 +6,6 @@ const OpenAI = require('openai');
 const multer = require('multer');
 const { makeRhythmStore } = require('./lib/rhythmStore');
 const crypto = require('node:crypto');
-const fs = require('node:fs');
-const fsp = require('node:fs/promises');
-const path = require('node:path');
 
 process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION:', err);
@@ -895,20 +892,18 @@ function resolvePreset(preset) {
 }
 
 // === TTS 音频缓存 ===
-// 按 (清洗后的文本 + preset) 的 SHA256 缓存生成好的 mp3，命中时直接读盘返回，
-// 不用再花 ElevenLabs 额度；30 天没被访问过的文件视为冷数据，定期清理掉。
-const AUDIO_CACHE_DIR = path.join(__dirname, 'audio-cache');
-fs.mkdirSync(AUDIO_CACHE_DIR, { recursive: true });
-
-const AUDIO_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+// 按 (清洗后的文本 + preset) 的 SHA256 缓存生成好的 mp3，存在 Supabase Storage 的
+// tts-cache bucket 里（不用 Render 的本地磁盘——那是临时文件系统，每次部署/重启都会清空，
+// 存不住缓存）。命中时直接从 Storage 读回，不用再花 ElevenLabs 额度。
+const TTS_BUCKET = 'tts-cache';
 const MP3_BITRATE_BPS = 128000; // ElevenLabs 这个接口默认输出 128kbps CBR mp3
 
 function ttsCacheKey(text, preset) {
   return crypto.createHash('sha256').update(`${text}::${preset}`).digest('hex');
 }
 
-function ttsCachePath(text, preset) {
-  return path.join(AUDIO_CACHE_DIR, `${ttsCacheKey(text, preset)}.mp3`);
+function ttsCacheObjectPath(text, preset) {
+  return `${ttsCacheKey(text, preset)}.mp3`;
 }
 
 function estimateMp3DurationFromSize(byteLength) {
@@ -922,23 +917,26 @@ function estimateDurationFromText(text) {
   return cjkMatches.length * 0.3 + wordMatches.length * 0.4;
 }
 
-async function cleanupAudioCache() {
-  try {
-    const files = await fsp.readdir(AUDIO_CACHE_DIR);
-    const now = Date.now();
-    await Promise.all(files.map(async (file) => {
-      const filePath = path.join(AUDIO_CACHE_DIR, file);
-      try {
-        const stat = await fsp.stat(filePath);
-        if (now - stat.mtimeMs > AUDIO_CACHE_MAX_AGE_MS) await fsp.unlink(filePath);
-      } catch { /* file may have been removed concurrently, ignore */ }
-    }));
-  } catch (err) {
-    console.error('Audio cache cleanup error:', err.message);
-  }
+async function readTtsCache(objectPath) {
+  const { data, error } = await supabase.storage.from(TTS_BUCKET).download(objectPath);
+  if (error || !data) return null;
+  return Buffer.from(await data.arrayBuffer());
 }
-cleanupAudioCache();
-setInterval(cleanupAudioCache, 24 * 60 * 60 * 1000);
+
+async function writeTtsCache(objectPath, buffer) {
+  // upsert:true so two concurrent requests for the same brand-new line don't race on a 409
+  const { error } = await supabase.storage.from(TTS_BUCKET)
+    .upload(objectPath, buffer, { contentType: 'audio/mpeg', upsert: true, cacheControl: '2592000' });
+  if (error) console.error('TTS cache upload error:', error.message);
+}
+
+// 轻量地拿缓存文件大小估算时长，不用把整个mp3下载下来
+async function statTtsCache(objectPath) {
+  const { data, error } = await supabase.storage.from(TTS_BUCKET).list('', { search: objectPath });
+  if (error || !data || !data.length) return null;
+  const hit = data.find(f => f.name === objectPath);
+  return hit?.metadata?.size ?? null;
+}
 
 app.post('/api/tts', async (req, res) => {
   let { text, preset } = req.body;
@@ -949,12 +947,11 @@ app.post('/api/tts', async (req, res) => {
   if (containsChinese(text)) return res.status(422).json({ error: 'tts is for non-Chinese text only' });
   preset = resolvePreset(preset);
 
-  const cachePath = ttsCachePath(text, preset);
+  const objectPath = ttsCacheObjectPath(text, preset);
 
   try {
-    const cached = await fsp.readFile(cachePath).catch(() => null);
+    const cached = await readTtsCache(objectPath);
     if (cached) {
-      fsp.utimes(cachePath, new Date(), new Date()).catch(() => {});
       res.setHeader('Content-Type', 'audio/mpeg');
       res.setHeader('X-Audio-Duration', estimateMp3DurationFromSize(cached.length).toFixed(2));
       return res.end(cached);
@@ -981,7 +978,7 @@ app.post('/api/tts', async (req, res) => {
     }
 
     const audioBuffer = Buffer.from(await elevenRes.arrayBuffer());
-    await fsp.writeFile(cachePath, audioBuffer);
+    await writeTtsCache(objectPath, audioBuffer);
 
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('X-Audio-Duration', estimateMp3DurationFromSize(audioBuffer.length).toFixed(2));
@@ -1000,13 +997,10 @@ app.get('/api/tts/duration', async (req, res) => {
   if (!text) return res.status(400).json({ error: 'missing text' });
   preset = resolvePreset(preset);
 
-  const cachePath = ttsCachePath(text, preset);
-  try {
-    const stat = await fsp.stat(cachePath);
-    return res.json({ duration: estimateMp3DurationFromSize(stat.size) });
-  } catch {
-    return res.json({ duration: estimateDurationFromText(text) });
-  }
+  const objectPath = ttsCacheObjectPath(text, preset);
+  const size = await statTtsCache(objectPath).catch(() => null);
+  if (size != null) return res.json({ duration: estimateMp3DurationFromSize(size) });
+  return res.json({ duration: estimateDurationFromText(text) });
 });
 
 // === 游戏：你画我猜 ===
