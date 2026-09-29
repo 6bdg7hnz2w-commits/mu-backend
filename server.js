@@ -39,10 +39,16 @@ const supabase = createClient(
 // TTS 缓存单独用 service key 建的 client：SUPABASE_KEY 权限不够写 Storage（RLS 卡住，
 // tts-cache bucket 一直是空的），只有这把 service key 能绕过 RLS 读写。别处都还用上面
 // 那个普通 client。
-const ttsStorage = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+// createClient 在 key 缺失/空字符串时会同步 throw（"supabaseKey is required"），这行代码
+// 在 require 阶段就跑，一旦 SUPABASE_SERVICE_KEY 没配上就会直接把整个进程崩掉在启动
+// 阶段——TTS 缓存挂了不该连累全站，所以这里手动判断一次，缺key就不建这个client，
+// 缓存功能优雅降级成"不缓存"，而不是让服务器起不来。
+const ttsStorage = process.env.SUPABASE_SERVICE_KEY
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
+  : null;
+if (!ttsStorage) {
+  console.error('SUPABASE_SERVICE_KEY not set — TTS cache is disabled, every /api/tts call will re-hit ElevenLabs');
+}
 
 const rhythmStore = makeRhythmStore(supabase);
 
@@ -98,7 +104,9 @@ const MODEL_MAP = {
 const RELAY_DEFAULT_MODEL = '[N]claude-sonnet-4-6';
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: '沐在这里' });
+  // ttsCacheReady 只是"这把 key 有没有被进程读到"的布尔值，不泄露 key 本身，用来在没有
+  // Render 日志权限的情况下也能从外面确认 SUPABASE_SERVICE_KEY 是不是真的生效了。
+  res.json({ status: 'ok', message: '沐在这里', ttsCacheReady: !!ttsStorage });
 });
 
 // === 会话 ===
@@ -931,6 +939,7 @@ function isTtsNotFoundError(error) {
 }
 
 async function readTtsCache(objectPath) {
+  if (!ttsStorage) return null;
   const { data, error } = await ttsStorage.storage.from(TTS_BUCKET).download(objectPath);
   if (error) {
     if (!isTtsNotFoundError(error)) console.error(`TTS CACHE READ FAILED (${objectPath}):`, error.message, error);
@@ -940,6 +949,7 @@ async function readTtsCache(objectPath) {
 }
 
 async function writeTtsCache(objectPath, buffer) {
+  if (!ttsStorage) return;
   // upsert:true so two concurrent requests for the same brand-new line don't race on a 409
   const { error } = await ttsStorage.storage.from(TTS_BUCKET)
     .upload(objectPath, buffer, { contentType: 'audio/mpeg', upsert: true, cacheControl: '2592000' });
@@ -951,6 +961,7 @@ async function writeTtsCache(objectPath, buffer) {
 
 // 轻量地拿缓存文件大小估算时长，不用把整个mp3下载下来
 async function statTtsCache(objectPath) {
+  if (!ttsStorage) return null;
   const { data, error } = await ttsStorage.storage.from(TTS_BUCKET).list('', { search: objectPath });
   if (error) {
     console.error(`TTS CACHE STAT FAILED (${objectPath}):`, error.message, error);
