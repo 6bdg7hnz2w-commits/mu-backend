@@ -38,7 +38,7 @@ function parseChapterFile(filePath) {
 async function main() {
   await ensureTables();
 
-  const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+  const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_KEY);
   const book = JSON.parse(fs.readFileSync(bookJsonPath, 'utf8'));
 
   const { data: existing } = await supabase

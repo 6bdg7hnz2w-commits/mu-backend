@@ -31,28 +31,21 @@ const upload = multer({
   }
 });
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
-);
-
-// TTS 缓存单独用 service key 建的 client：SUPABASE_KEY 权限不够写 Storage（RLS 卡住，
-// tts-cache bucket 一直是空的），只有这把 service key 能绕过 RLS 读写。别处都还用上面
-// 那个普通 client。
-// createClient 在 key 缺失/空字符串时会同步 throw（"supabaseKey is required"），这行代码
-// 在 require 阶段就跑，一旦 SUPABASE_SERVICE_KEY 没配上就会直接把整个进程崩掉在启动
-// 阶段——TTS 缓存挂了不该连累全站，所以这里手动判断一次，缺key就不建这个client，
-// 缓存功能优雅降级成"不缓存"，而不是让服务器起不来。
-// Render 日志实测抓到的真实原因：这把 key 的值中间夹了一个换行符（大概率是从某个换行
-// 显示的地方复制粘贴带进来的），不是首尾空格——.trim() 不会管中间，所以连着 \r\n 一起
-// 挖掉，混进 Authorization header 才不会让 fetch 的 Headers.set 抛 "invalid header value"。
-const ttsServiceKey = process.env.SUPABASE_SERVICE_KEY?.replace(/[\r\n]/g, '').trim();
-const ttsStorage = ttsServiceKey
-  ? createClient(process.env.SUPABASE_URL, ttsServiceKey)
-  : null;
-if (!ttsStorage) {
-  console.error('SUPABASE_SERVICE_KEY not set — TTS cache is disabled, every /api/tts call will re-hit ElevenLabs');
+// 所有 Supabase 访问（表、Storage）都走 service key：public 下的表开了 RLS 且没有策略，
+// anon/publishable key 读写会被拒绝，只有后端持有的 service key 能绕过 RLS。
+// 这把 key 只能放在后端环境变量里，绝不能下发给浏览器。
+// Render 日志实测抓到的真实原因：这把 key 的值中间夹过一个换行符（大概率是从某个换行
+// 显示的地方复制粘贴带进来的），.trim() 不管中间，所以连着 \r\n 一起挖掉，混进
+// Authorization header 才不会让 fetch 的 Headers.set 抛 "invalid header value"。
+const serviceKey = process.env.SUPABASE_SERVICE_KEY?.replace(/[\r\n]/g, '').trim();
+if (!serviceKey) {
+  // createClient 在 key 缺失时会同步 throw；缺 key 时退回 SUPABASE_KEY 只是为了本地能起得来，
+  // 表开了 RLS 之后这样的查询都会被拒绝，所以这里大声报错
+  console.error('SUPABASE_SERVICE_KEY not set — falling back to SUPABASE_KEY; queries will be rejected once RLS is on, and the TTS cache is disabled');
 }
+const supabase = createClient(process.env.SUPABASE_URL, serviceKey || process.env.SUPABASE_KEY);
+// TTS 缓存：没有 service key 时不缓存（每次都重新请求 ElevenLabs），而不是让服务器起不来
+const ttsStorage = serviceKey ? supabase : null;
 
 const rhythmStore = makeRhythmStore(supabase);
 
@@ -108,9 +101,9 @@ const MODEL_MAP = {
 const RELAY_DEFAULT_MODEL = '[N]claude-sonnet-4-6';
 
 app.get('/health', (req, res) => {
-  // ttsCacheReady 只是"这把 key 有没有被进程读到"的布尔值，不泄露 key 本身，用来在没有
+  // ttsCacheReady / dbServiceKey 只是"这把 key 有没有被进程读到"的布尔值，不泄露 key 本身，用来在没有
   // Render 日志权限的情况下也能从外面确认 SUPABASE_SERVICE_KEY 是不是真的生效了。
-  res.json({ status: 'ok', message: '沐在这里', ttsCacheReady: !!ttsStorage });
+  res.json({ status: 'ok', message: '沐在这里', ttsCacheReady: !!ttsStorage, dbServiceKey: !!serviceKey });
 });
 
 // === 会话 ===
