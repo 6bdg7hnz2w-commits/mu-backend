@@ -20,7 +20,7 @@ const app = express();
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://mu-frontend.onrender.com,http://localhost:5173')
   .split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({ origin: ALLOWED_ORIGINS, exposedHeaders: ['X-Audio-Duration'] }));
-app.use(express.json());
+app.use(express.json({ limit: '1mb' })); // /api/cc/history/import 一次会带几百条旧记录
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -778,20 +778,19 @@ function beijingToday() {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai' }).format(new Date());
 }
 
-// 日记表没有日期列，卡片按 created_at 显示日期，所以记在那天北京时间 23:59
+// date 是日记写的是哪一天（存进 diary_date），created_at 是真正写入的时间；同一天重复写入会覆盖内容并刷新写入时间
 app.put('/api/mu/diary', requireAppKey, async (req, res) => {
   const date = parseDateParam(req.body?.date);
   const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
   if (!date || !content) return res.status(400).json({ error: 'date (YYYY-MM-DD) and content required' });
-  const createdAt = `${date}T23:59:00+08:00`;
+  const createdAt = new Date().toISOString();
   const { data: existing, error: findErr } = await supabase
-    .from('diaries').select('id').eq('author', 'mu')
-    .gte('created_at', `${date}T00:00:00+08:00`).lte('created_at', createdAt)
+    .from('diaries').select('id').eq('author', 'mu').eq('diary_date', date)
     .order('created_at', { ascending: false }).limit(1);
   if (findErr) return res.status(500).json({ error: findErr.message });
   const query = existing?.length
     ? supabase.from('diaries').update({ content, created_at: createdAt }).eq('id', existing[0].id)
-    : supabase.from('diaries').insert({ author: 'mu', content, created_at: createdAt });
+    : supabase.from('diaries').insert({ author: 'mu', content, created_at: createdAt, diary_date: date });
   const { data, error } = await query.select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
@@ -1372,7 +1371,8 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
       console.error('CC bridge send failed:', r.status);
       return res.status(r.status === 400 ? 400 : 502).json({ error: `bridge ${r.status}` });
     }
-    res.json({ ok: true });
+    const data = await r.json().catch(() => ({}));
+    res.json({ ok: true, id: data.id, time: data.time });
   } catch (err) {
     console.error('CC bridge send error:', err.message);
     res.status(502).json({ error: 'bridge unreachable' });
@@ -1424,6 +1424,49 @@ app.get('/api/cc/uploads/:date/:file', requireAppKey, async (req, res) => {
     res.send(Buffer.from(await r.arrayBuffer()));
   } catch (err) {
     console.error('CC bridge uploads error:', err.message);
+    res.status(502).json({ error: 'bridge unreachable' });
+  }
+});
+
+// 聊天记录：bridge 把 inbox（桦桦）和 outbox（沐）合并后按时间返回
+app.get('/api/cc/history', requireAppKey, async (req, res) => {
+  const bridge = bridgeConfig();
+  if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+  const qs = new URLSearchParams();
+  if (typeof req.query.before === 'string') qs.set('before', req.query.before);
+  if (typeof req.query.limit === 'string') qs.set('limit', req.query.limit);
+  try {
+    const r = await fetch(`${bridge.url}/history?${qs}`, {
+      headers: { 'Authorization': `Bearer ${bridge.token}` },
+      signal: AbortSignal.timeout(15000)
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(r.status === 400 ? 400 : 502).json({ error: data.error || `bridge ${r.status}` });
+    res.json(data);
+  } catch (err) {
+    console.error('CC bridge history error:', err.message);
+    res.status(502).json({ error: 'bridge unreachable' });
+  }
+});
+
+// 一次性把浏览器 localStorage 里的旧发送记录迁到 bridge（bridge 按 time+text 去重）
+app.post('/api/cc/history/import', requireAppKey, async (req, res) => {
+  const bridge = bridgeConfig();
+  if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+  const messages = Array.isArray(req.body?.messages) ? req.body.messages : null;
+  if (!messages) return res.status(400).json({ error: 'messages required' });
+  try {
+    const r = await fetch(`${bridge.url}/import`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages }),
+      signal: AbortSignal.timeout(15000)
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(r.status === 400 ? 400 : 502).json({ error: data.error || `bridge ${r.status}` });
+    res.json(data);
+  } catch (err) {
+    console.error('CC bridge import error:', err.message);
     res.status(502).json({ error: 'bridge unreachable' });
   }
 });
