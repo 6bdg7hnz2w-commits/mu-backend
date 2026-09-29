@@ -36,6 +36,14 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
+// TTS 缓存单独用 service key 建的 client：SUPABASE_KEY 权限不够写 Storage（RLS 卡住，
+// tts-cache bucket 一直是空的），只有这把 service key 能绕过 RLS 读写。别处都还用上面
+// 那个普通 client。
+const ttsStorage = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+
 const rhythmStore = makeRhythmStore(supabase);
 
 // 所有 Claude 调用（聊天、日记、你画我猜）统一走中转站 cn.jixiangai.xyz，
@@ -917,23 +925,38 @@ function estimateDurationFromText(text) {
   return cjkMatches.length * 0.3 + wordMatches.length * 0.4;
 }
 
+// "Object not found" is the expected shape of a plain cache miss — not an error worth logging.
+function isTtsNotFoundError(error) {
+  return !!error && (error.status === 404 || error.statusCode === '404' || /not.?found/i.test(error.message || ''));
+}
+
 async function readTtsCache(objectPath) {
-  const { data, error } = await supabase.storage.from(TTS_BUCKET).download(objectPath);
-  if (error || !data) return null;
+  const { data, error } = await ttsStorage.storage.from(TTS_BUCKET).download(objectPath);
+  if (error) {
+    if (!isTtsNotFoundError(error)) console.error(`TTS CACHE READ FAILED (${objectPath}):`, error.message, error);
+    return null;
+  }
   return Buffer.from(await data.arrayBuffer());
 }
 
 async function writeTtsCache(objectPath, buffer) {
   // upsert:true so two concurrent requests for the same brand-new line don't race on a 409
-  const { error } = await supabase.storage.from(TTS_BUCKET)
+  const { error } = await ttsStorage.storage.from(TTS_BUCKET)
     .upload(objectPath, buffer, { contentType: 'audio/mpeg', upsert: true, cacheControl: '2592000' });
-  if (error) console.error('TTS cache upload error:', error.message);
+  // Loud on purpose: a swallowed failure here looks identical to a slow cache hit from the
+  // outside (still 200s audio to the caller), so a silent console.error was easy to miss —
+  // this cache went silently unwritten in production for a while because of exactly that.
+  if (error) console.error(`TTS CACHE WRITE FAILED for ${objectPath} — every future request for this line will re-hit ElevenLabs:`, error.message, error);
 }
 
 // 轻量地拿缓存文件大小估算时长，不用把整个mp3下载下来
 async function statTtsCache(objectPath) {
-  const { data, error } = await supabase.storage.from(TTS_BUCKET).list('', { search: objectPath });
-  if (error || !data || !data.length) return null;
+  const { data, error } = await ttsStorage.storage.from(TTS_BUCKET).list('', { search: objectPath });
+  if (error) {
+    console.error(`TTS CACHE STAT FAILED (${objectPath}):`, error.message, error);
+    return null;
+  }
+  if (!data || !data.length) return null;
   const hit = data.find(f => f.name === objectPath);
   return hit?.metadata?.size ?? null;
 }
