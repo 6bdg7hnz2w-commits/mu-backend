@@ -43,8 +43,11 @@ const supabase = createClient(
 // 在 require 阶段就跑，一旦 SUPABASE_SERVICE_KEY 没配上就会直接把整个进程崩掉在启动
 // 阶段——TTS 缓存挂了不该连累全站，所以这里手动判断一次，缺key就不建这个client，
 // 缓存功能优雅降级成"不缓存"，而不是让服务器起不来。
-const ttsStorage = process.env.SUPABASE_SERVICE_KEY
-  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
+// .trim()：Render 环境变量面板粘贴 key 时很容易带上首尾空格/换行，混进 Authorization
+// header 会让 fetch 的 Headers.set 直接抛 "invalid header value"——实测就是这样炸的。
+const ttsServiceKey = process.env.SUPABASE_SERVICE_KEY?.trim();
+const ttsStorage = ttsServiceKey
+  ? createClient(process.env.SUPABASE_URL, ttsServiceKey)
   : null;
 if (!ttsStorage) {
   console.error('SUPABASE_SERVICE_KEY not set — TTS cache is disabled, every /api/tts call will re-hit ElevenLabs');
