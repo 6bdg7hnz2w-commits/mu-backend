@@ -1354,21 +1354,76 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
   const bridge = bridgeConfig();
   if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
   const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
-  if (!text) return res.status(400).json({ error: 'text required' });
+  // images 是 /api/cc/upload 返回的 path，原样交给 bridge（bridge 会再校验一遍必须在 uploads 目录下）
+  const images = req.body?.images;
+  if (images !== undefined && (!Array.isArray(images) || images.length > 4 || !images.every(p => typeof p === 'string'))) {
+    return res.status(400).json({ error: 'images must be up to 4 paths' });
+  }
+  const hasImages = Array.isArray(images) && images.length > 0;
+  if (!text && !hasImages) return res.status(400).json({ error: 'text required' });
   try {
     const r = await fetch(`${bridge.url}/send`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify(hasImages ? { text, images } : { text }),
       signal: AbortSignal.timeout(15000)
     });
     if (!r.ok) {
       console.error('CC bridge send failed:', r.status);
-      return res.status(502).json({ error: `bridge ${r.status}` });
+      return res.status(r.status === 400 ? 400 : 502).json({ error: `bridge ${r.status}` });
     }
     res.json({ ok: true });
   } catch (err) {
     console.error('CC bridge send error:', err.message);
+    res.status(502).json({ error: 'bridge unreachable' });
+  }
+});
+
+// 图片上传：multipart 字段名 image，转成原始字节转发给 bridge /upload，返回 bridge 的 {id, path}
+const ccImageUpload = upload.single('image');
+app.post('/api/cc/upload', requireAppKey, (req, res) => {
+  ccImageUpload(req, res, async (uploadErr) => {
+    if (uploadErr) {
+      const tooLarge = uploadErr.code === 'LIMIT_FILE_SIZE';
+      return res.status(tooLarge ? 413 : 400).json({ error: tooLarge ? 'image too large (max 10MB)' : uploadErr.message });
+    }
+    const bridge = bridgeConfig();
+    if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+    if (!req.file) return res.status(400).json({ error: 'image required' });
+    try {
+      const r = await fetch(`${bridge.url}/upload`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': req.file.mimetype },
+        body: req.file.buffer,
+        signal: AbortSignal.timeout(30000)
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        console.error('CC bridge upload failed:', r.status);
+        return res.status([413, 415].includes(r.status) ? r.status : 502).json({ error: data.error || `bridge ${r.status}` });
+      }
+      res.json({ id: data.id, path: data.path });
+    } catch (err) {
+      console.error('CC bridge upload error:', err.message);
+      res.status(502).json({ error: 'bridge unreachable' });
+    }
+  });
+});
+
+// 回显：浏览器 <img> 带不了 Authorization，所以前端用 fetch 带口令取回再显示
+app.get('/api/cc/uploads/:date/:file', requireAppKey, async (req, res) => {
+  const bridge = bridgeConfig();
+  if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+  try {
+    const r = await fetch(`${bridge.url}/uploads/${encodeURIComponent(req.params.date)}/${encodeURIComponent(req.params.file)}`, {
+      headers: { 'Authorization': `Bearer ${bridge.token}` },
+      signal: AbortSignal.timeout(30000)
+    });
+    if (!r.ok) return res.status(r.status === 404 ? 404 : 502).json({ error: `bridge ${r.status}` });
+    res.set({ 'Content-Type': r.headers.get('content-type') || 'application/octet-stream', 'Cache-Control': 'private, max-age=86400' });
+    res.send(Buffer.from(await r.arrayBuffer()));
+  } catch (err) {
+    console.error('CC bridge uploads error:', err.message);
     res.status(502).json({ error: 'bridge unreachable' });
   }
 });
