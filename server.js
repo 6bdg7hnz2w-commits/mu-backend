@@ -1497,10 +1497,12 @@ app.get('/api/cc/events', requireAppKey, async (req, res) => {
     'X-Accel-Buffering': 'no'
   });
   res.flushHeaders();
+  // 立刻写一行：让 Cloudflare/Render 代理马上把响应头和第一个字节放给浏览器，前端才不会一直卡在 connecting
+  res.write(': connected\n\n');
 
   // 心跳防止 Render/代理把空闲连接掐掉；只在上一块以换行结尾时插入，避免切断一行 JSON
   let atLineStart = true;
-  heartbeat = setInterval(() => { if (atLineStart) res.write(': ping\n\n'); }, 25000);
+  heartbeat = setInterval(() => { if (atLineStart) res.write(': ping\n\n'); }, 15000);
 
   try {
     for await (const chunk of r.body) {
