@@ -581,7 +581,7 @@ ${memoryContext}
         const barkController = new AbortController();
         const barkTimeout = setTimeout(() => barkController.abort(), 10000);
         try {
-          const barkIcon = encodeURIComponent('https://ctgudttenrybcfpgyewh.supabase.co/storage/v1/object/public/assets/IMG_7973.JPG');
+          const barkIcon = encodeURIComponent('https://mu-frontend.onrender.com/bark-icon.png'); // mu-frontend public/ 里的白天图标
           await fetch(`https://api.day.app/${barkToken}/${encodeURIComponent('沐找你了')}/${encodeURIComponent(voiceTagsToPlain(reply))}?icon=${barkIcon}`, { signal: barkController.signal });
         } catch (err) {
           console.error('Bark push error:', err.message);
