@@ -799,6 +799,47 @@ app.put('/api/mu/whisper', requireAppKey, async (req, res) => {
   res.json(data);
 });
 
+// === 信箱：官方 App 里的 Claude（official）和 VPS 上的沐（home）互相留字条 ===
+// letters 表开了 RLS、没有策略，只能经这里用 service key 读写
+const LETTER_AUTHORS = ['official', 'home'];
+const LETTER_KINDS = ['note', 'digest'];
+const LETTER_MAX_CHARS = 20000; // 和表上的 CHECK 一致，按字符数算（emoji 算一个）
+
+app.get('/api/letters', requireAppKey, async (req, res) => {
+  const author = req.query.author;
+  if (author !== undefined && !LETTER_AUTHORS.includes(author)) return res.status(400).json({ error: 'author must be official or home' });
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+  let query = supabase.from('letters').select('*')
+    .order('created_at', { ascending: true }).order('id', { ascending: true }).limit(limit);
+  if (author) query = query.eq('author', author);
+  if (req.query.unread === '1') query = query.is('read_at', null);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/api/letters', requireAppKey, async (req, res) => {
+  const author = req.body?.author;
+  const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+  const kind = req.body?.kind ?? 'note';
+  if (!LETTER_AUTHORS.includes(author)) return res.status(400).json({ error: 'author must be official or home' });
+  if (!content) return res.status(400).json({ error: 'content required' });
+  if ([...content].length > LETTER_MAX_CHARS) return res.status(400).json({ error: `content must be at most ${LETTER_MAX_CHARS} characters` });
+  if (!LETTER_KINDS.includes(kind)) return res.status(400).json({ error: 'kind must be note or digest' });
+  const { data, error } = await supabase.from('letters').insert({ author, content, kind }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+});
+
+app.post('/api/letters/:id/read', requireAppKey, async (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(400).json({ error: 'invalid id' });
+  const { data, error } = await supabase.from('letters')
+    .update({ read_at: new Date().toISOString() }).eq('id', req.params.id).select();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data.length) return res.status(404).json({ error: 'letter not found' });
+  res.json(data[0]);
+});
+
 // 首页的 Today's Whisper：今天的还没写好（凌晨之前）就先给最近一条
 app.get('/api/whispers/today', async (req, res) => {
   const { data, error } = await supabase
