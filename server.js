@@ -840,6 +840,293 @@ app.post('/api/letters/:id/read', requireAppKey, async (req, res) => {
   res.json(data[0]);
 });
 
+// === 日历：events 表开了 RLS、没有策略，只能经这里用 service key 读写 ===
+// 时区一律按 Asia/Shanghai（没有夏令时，固定 +08:00）：
+// 全天事件用 start_date/end_date（end 含当天），定时事件用 starts_at/ends_at
+const EVENT_KINDS = ['event', 'important'];
+const EVENT_REPEATS = ['none', 'monthly', 'yearly'];
+const EVENT_TEXT_LIMITS = { title: 200, location: 200, notes: 5000, emoji: 32, external_id: 200 }; // 按字符数
+const EVENT_MAX_RANGE_DAYS = 400;
+const SYNC_MAX_EVENTS = 2000;
+const SYNC_FIELDS = ['title', 'all_day', 'start_date', 'end_date', 'starts_at', 'ends_at', 'location', 'notes'];
+const SH_OFFSET = '+08:00';
+
+const pad2 = (n) => String(n).padStart(2, '0');
+const isDateStr = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s;
+const addDays = (d, n) => new Date(Date.parse(`${d}T00:00:00Z`) + n * 86400000).toISOString().slice(0, 10);
+const daysDiff = (a, b) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86400000);
+const shanghaiDateOf = (iso) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai' }).format(new Date(iso));
+// 某天上海 0 点对应的 UTC 时间；去掉毫秒，免得 PostgREST 的 or() 过滤里多出一个点
+const shanghaiMidnightIso = (d) => new Date(`${d}T00:00:00${SH_OFFSET}`).toISOString().replace('.000Z', 'Z');
+const shiftIso = (iso, days) => new Date(Date.parse(iso) + days * 86400000).toISOString();
+
+// 带时区的 ISO 时间原样理解；不带时区的（"2026-10-09T14:00"）按上海时间
+function parseTimestamp(v) {
+  if (typeof v !== 'string') return null;
+  const s = v.trim();
+  const m = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})?$/.exec(s);
+  if (!m) return null;
+  const t = Date.parse(m[3] ? s : s + SH_OFFSET);
+  return Number.isFinite(t) ? new Date(t).toISOString() : null;
+}
+
+function checkRange(from, to) {
+  if (!isDateStr(from) || !isDateStr(to)) return 'from and to (YYYY-MM-DD) required';
+  if (from > to) return 'from must not be after to';
+  if (daysDiff(from, to) > EVENT_MAX_RANGE_DAYS) return `range must be at most ${EVENT_MAX_RANGE_DAYS} days`;
+  return null;
+}
+
+// 把请求体整理成 events 的一行；base 是 PUT 时库里原来那行（没传的字段沿用它）。source 由调用方决定
+function buildEventRow(body, base = {}) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { error: 'body must be a JSON object' };
+  const pick = (k) => (k in body ? body[k] : base[k]);
+  const row = {};
+  for (const k of Object.keys(EVENT_TEXT_LIMITS)) {
+    let v = pick(k);
+    if (v === undefined || v === null) v = null;
+    else if (typeof v !== 'string') return { error: `${k} must be a string` };
+    else v = v.trim() || null;
+    if (v && [...v].length > EVENT_TEXT_LIMITS[k]) return { error: `${k} must be at most ${EVENT_TEXT_LIMITS[k]} characters` };
+    row[k] = v;
+  }
+  if (!row.title) return { error: 'title required' };
+  row.kind = pick('kind') ?? 'event';
+  if (!EVENT_KINDS.includes(row.kind)) return { error: 'kind must be event or important' };
+  row.repeat = pick('repeat') ?? 'none';
+  if (!EVENT_REPEATS.includes(row.repeat)) return { error: 'repeat must be none, monthly or yearly' };
+  row.all_day = pick('all_day') ?? false;
+  if (typeof row.all_day !== 'boolean') return { error: 'all_day must be true or false' };
+
+  if (row.all_day) {
+    const sd = pick('start_date');
+    const ed = pick('end_date') ?? null;
+    if (!isDateStr(sd)) return { error: 'start_date (YYYY-MM-DD) required for all-day events' };
+    if (ed !== null && !isDateStr(ed)) return { error: 'end_date must be YYYY-MM-DD' };
+    if (ed && ed < sd) return { error: 'end_date must not be before start_date' };
+    Object.assign(row, { start_date: sd, end_date: ed, starts_at: null, ends_at: null });
+  } else {
+    const sa = parseTimestamp(pick('starts_at'));
+    if (!sa) return { error: 'starts_at required for timed events (ISO time; Asia/Shanghai if no offset)' };
+    const rawEa = pick('ends_at');
+    let ea = null;
+    if (rawEa !== undefined && rawEa !== null && rawEa !== '') {
+      ea = parseTimestamp(rawEa);
+      if (!ea) return { error: 'ends_at must be an ISO time' };
+      if (ea < sa) return { error: 'ends_at must not be before starts_at' };
+    }
+    Object.assign(row, { starts_at: sa, ends_at: ea, start_date: null, end_date: null });
+  }
+  return { row };
+}
+
+const isRepeatingEvent = (e) => e.kind === 'important' && e.repeat !== 'none';
+const eventStartDate = (e) => (e.all_day ? e.start_date : shanghaiDateOf(e.starts_at));
+const eventEndDate = (e) => (e.all_day ? e.end_date || e.start_date : shanghaiDateOf(e.ends_at || e.starts_at));
+// 全天的排在同一天的定时事件前面
+const eventSortKey = (e) => (e.all_day ? `${e.start_date} 0` : `${shanghaiDateOf(e.starts_at)} 1 ${e.starts_at}`);
+
+// 重要日期按 monthly/yearly 展开到 [from, to]。某月没有这一天（31 号、2 月 29 日）就跳过，和 ICS 的 RRULE 一致
+function expandRepeating(e, from, to) {
+  const base = eventStartDate(e);
+  const span = daysDiff(base, eventEndDate(e));
+  const [, baseMonth, baseDay] = base.split('-').map(Number);
+  const out = [];
+  // 往前多看 span 天，盖住 from 的多日事件也要算进来
+  let [y, m] = addDays(from, -span).split('-').map(Number);
+  const [toY, toM] = to.split('-').map(Number);
+  while (y < toY || (y === toY && m <= toM)) {
+    const occ = `${y}-${pad2(m)}-${pad2(baseDay)}`;
+    if ((e.repeat === 'monthly' || m === baseMonth) && isDateStr(occ) && occ >= base && occ <= to && addDays(occ, span) >= from) {
+      const shift = daysDiff(base, occ);
+      const inst = { ...e, instance: occ !== base, series_id: e.id, occurrence_date: occ };
+      if (e.all_day) Object.assign(inst, { start_date: occ, end_date: e.end_date ? addDays(occ, span) : null });
+      else Object.assign(inst, { starts_at: shiftIso(e.starts_at, shift), ends_at: e.ends_at ? shiftIso(e.ends_at, shift) : null });
+      out.push(inst);
+    }
+    if (m === 12) { y++; m = 1; } else m++;
+  }
+  return out;
+}
+
+// 和 [from, to]（上海日期，含两端）有交集的事件：全天的和定时的分两次查。scope 用来再加过滤条件
+function eventsInRange(from, to, columns = '*', scope = (q) => q) {
+  const fromTs = shanghaiMidnightIso(from);
+  const toTs = shanghaiMidnightIso(addDays(to, 1));
+  return Promise.all([
+    scope(supabase.from('events').select(columns).eq('all_day', true)
+      .lte('start_date', to).or(`end_date.gte.${from},start_date.gte.${from}`)),
+    scope(supabase.from('events').select(columns).eq('all_day', false)
+      .lt('starts_at', toTs).or(`ends_at.gte.${fromTs},starts_at.gte.${fromTs}`)),
+  ]);
+}
+
+app.get('/api/events', requireAppKey, async (req, res) => {
+  const { from, to } = req.query;
+  const rangeError = checkRange(from, to);
+  if (rangeError) return res.status(400).json({ error: rangeError });
+  const [[allDay, timed], repeating] = await Promise.all([
+    eventsInRange(from, to),
+    supabase.from('events').select('*').eq('kind', 'important').neq('repeat', 'none'),
+  ]);
+  const error = allDay.error || timed.error || repeating.error;
+  if (error) return res.status(500).json({ error: error.message });
+  const out = [...allDay.data, ...timed.data].filter((e) => !isRepeatingEvent(e)).map((e) => ({ ...e, instance: false }));
+  for (const e of repeating.data) out.push(...expandRepeating(e, from, to));
+  out.sort((a, b) => eventSortKey(a).localeCompare(eventSortKey(b)));
+  res.json(out);
+});
+
+app.post('/api/events', requireAppKey, async (req, res) => {
+  const source = req.body?.source ?? 'home';
+  if (!['home', 'mu'].includes(source)) return res.status(400).json({ error: 'source must be home or mu (phone events only come in via /api/events/sync)' });
+  const { row, error: invalid } = buildEventRow(req.body);
+  if (invalid) return res.status(400).json({ error: invalid });
+  const { data, error } = await supabase.from('events').insert({ ...row, source }).select().single();
+  if (error) return res.status(error.code === '23505' ? 409 : 500).json({ error: error.message });
+  res.status(201).json(data);
+});
+
+// 手机同步来的事件只读：在这里改了，下次同步也会被手机上的版本盖掉
+// 找不到或不能改时直接回错误，返回 null
+async function findEditableEvent(id, res) {
+  const fail = (code, error) => { res.status(code).json({ error }); return null; };
+  if (!/^\d+$/.test(id)) return fail(400, 'invalid id');
+  const { data, error } = await supabase.from('events').select('*').eq('id', id).maybeSingle();
+  if (error) return fail(500, error.message);
+  if (!data) return fail(404, 'event not found');
+  if (data.source === 'phone') return fail(403, 'phone events are read-only; edit them on the phone');
+  return data;
+}
+
+app.put('/api/events/:id', requireAppKey, async (req, res) => {
+  const existing = await findEditableEvent(req.params.id, res);
+  if (!existing) return;
+  if (req.body?.source !== undefined && req.body.source !== existing.source) return res.status(400).json({ error: 'source cannot be changed' });
+  const { row, error: invalid } = buildEventRow(req.body, existing);
+  if (invalid) return res.status(400).json({ error: invalid });
+  const { data, error } = await supabase.from('events')
+    .update({ ...row, updated_at: new Date().toISOString() }).eq('id', existing.id).select().single();
+  if (error) return res.status(error.code === '23505' ? 409 : 500).json({ error: error.message });
+  res.json(data);
+});
+
+app.delete('/api/events/:id', requireAppKey, async (req, res) => {
+  const existing = await findEditableEvent(req.params.id, res);
+  if (!existing) return;
+  const { error } = await supabase.from('events').delete().eq('id', existing.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+// 手机快捷指令用：在 [from, to] 范围内用这批数据替换 source=phone 的事件（按 external_id 新增/更新，删掉多出来的）
+app.post('/api/events/sync', requireAppKey, async (req, res) => {
+  const { source, from, to, events } = req.body || {};
+  if (source !== 'phone') return res.status(400).json({ error: 'only source=phone can be synced' });
+  const rangeError = checkRange(from, to);
+  if (rangeError) return res.status(400).json({ error: rangeError });
+  if (!Array.isArray(events)) return res.status(400).json({ error: 'events must be an array' });
+  if (events.length > SYNC_MAX_EVENTS) return res.status(400).json({ error: `at most ${SYNC_MAX_EVENTS} events per sync` });
+
+  const now = new Date().toISOString();
+  const rows = [];
+  const keep = new Set();
+  for (const [i, ev] of events.entries()) {
+    const externalId = typeof ev?.external_id === 'string' ? ev.external_id.trim() : '';
+    if (!externalId) return res.status(400).json({ error: `events[${i}].external_id required` });
+    if (keep.has(externalId)) return res.status(400).json({ error: `events[${i}].external_id is duplicated` });
+    keep.add(externalId);
+    // 手机来的只当普通日程：kind/repeat/emoji 不收外部值
+    const fields = Object.fromEntries(SYNC_FIELDS.filter((k) => k in ev).map((k) => [k, ev[k]]));
+    const { row, error: invalid } = buildEventRow({ ...fields, external_id: externalId, kind: 'event', repeat: 'none' });
+    if (invalid) return res.status(400).json({ error: `events[${i}]: ${invalid}` });
+    rows.push({ ...row, source: 'phone', updated_at: now });
+  }
+
+  // 先写这批，再删范围内多出来的：中途失败时宁可多留旧的，也不先删
+  if (rows.length) {
+    const { error } = await supabase.from('events').upsert(rows, { onConflict: 'source,external_id' });
+    if (error) return res.status(500).json({ error: error.message });
+  }
+  const [allDay, timed] = await eventsInRange(from, to, 'id, external_id', (q) => q.eq('source', 'phone'));
+  const findError = allDay.error || timed.error;
+  if (findError) return res.status(500).json({ error: findError.message });
+  const stale = [...allDay.data, ...timed.data].filter((e) => !keep.has(e.external_id)).map((e) => e.id);
+  if (stale.length) {
+    const { error } = await supabase.from('events').delete().in('id', stale);
+    if (error) return res.status(500).json({ error: error.message });
+  }
+  res.json({ ok: true, upserted: rows.length, deleted: stale.length });
+});
+
+// === 日历订阅：GET /api/calendar.ics?token=... ===
+// 手机订阅日历带不了请求头，所以用 query 里的 ICS_TOKEN，和 APP_PASSCODE 分开。
+// 只给 source=home/mu 的（重要日期都在里面）；不给 source=phone 的，免得转一圈又回到手机上
+const icsEscape = (s) => String(s).replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\r?\n/g, '\\n');
+const icsDate = (d) => d.replace(/-/g, '');
+const icsUtc = (iso) => new Date(iso).toISOString().replace(/\.\d{3}/, '').replace(/[-:]/g, '');
+const icsShanghai = (iso) => new Date(Date.parse(iso) + 8 * 3600000).toISOString().slice(0, 19).replace(/[-:]/g, '');
+
+// RFC 5545 折行：每行最多 75 字节（续行开头的空格也算），不拆开 UTF-8 多字节字符
+function icsFold(line) {
+  const parts = [];
+  let cur = '';
+  let bytes = 0;
+  for (const ch of line) {
+    const b = Buffer.byteLength(ch);
+    if (bytes + b > (parts.length ? 74 : 75)) { parts.push(cur); cur = ''; bytes = 0; }
+    cur += ch;
+    bytes += b;
+  }
+  parts.push(cur);
+  return parts.join('\r\n ');
+}
+
+function eventToVevent(e) {
+  const stamp = icsUtc(e.updated_at || e.created_at);
+  const lines = ['BEGIN:VEVENT', `UID:mu-event-${e.id}@mu-backend`, `DTSTAMP:${stamp}`, `CREATED:${icsUtc(e.created_at)}`, `LAST-MODIFIED:${stamp}`,
+    `SUMMARY:${icsEscape(e.emoji ? `${e.emoji} ${e.title}` : e.title)}`];
+  if (e.all_day) {
+    lines.push(`DTSTART;VALUE=DATE:${icsDate(e.start_date)}`, `DTEND;VALUE=DATE:${icsDate(addDays(e.end_date || e.start_date, 1))}`);
+  } else {
+    lines.push(`DTSTART;TZID=Asia/Shanghai:${icsShanghai(e.starts_at)}`);
+    if (e.ends_at) lines.push(`DTEND;TZID=Asia/Shanghai:${icsShanghai(e.ends_at)}`);
+  }
+  if (isRepeatingEvent(e)) lines.push(`RRULE:FREQ=${e.repeat === 'yearly' ? 'YEARLY' : 'MONTHLY'}`);
+  if (e.location) lines.push(`LOCATION:${icsEscape(e.location)}`);
+  if (e.notes) lines.push(`DESCRIPTION:${icsEscape(e.notes)}`);
+  lines.push('END:VEVENT');
+  return lines;
+}
+
+app.get('/api/calendar.ics', async (req, res) => {
+  const expected = (process.env.ICS_TOKEN || '').trim();
+  if (!expected) return res.status(503).type('text/plain').send('ICS_TOKEN not configured');
+  const got = typeof req.query.token === 'string' ? req.query.token : '';
+  const a = crypto.createHash('sha256').update(got).digest();
+  const b = crypto.createHash('sha256').update(expected).digest();
+  if (!got || !crypto.timingSafeEqual(a, b)) return res.status(401).type('text/plain').send('unauthorized');
+
+  const events = [];
+  for (let page = 0; ; page++) { // PostgREST 一次最多给 1000 行
+    const { data, error } = await supabase.from('events').select('*').neq('source', 'phone')
+      .order('id', { ascending: true }).range(page * 1000, page * 1000 + 999);
+    if (error) return res.status(500).type('text/plain').send(error.message);
+    events.push(...data);
+    if (data.length < 1000) break;
+  }
+  const lines = [
+    'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//mu//calendar//ZH', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH',
+    'X-WR-CALNAME:沐', 'NAME:沐', 'X-WR-TIMEZONE:Asia/Shanghai', 'REFRESH-INTERVAL;VALUE=DURATION:PT1H', 'X-PUBLISHED-TTL:PT1H',
+    'BEGIN:VTIMEZONE', 'TZID:Asia/Shanghai', 'BEGIN:STANDARD', 'DTSTART:19700101T000000',
+    'TZOFFSETFROM:+0800', 'TZOFFSETTO:+0800', 'TZNAME:CST', 'END:STANDARD', 'END:VTIMEZONE',
+    ...events.flatMap(eventToVevent),
+    'END:VCALENDAR',
+  ];
+  res.set({ 'Content-Type': 'text/calendar; charset=utf-8', 'Cache-Control': 'no-cache', 'Content-Disposition': 'inline; filename="mu.ics"' });
+  res.send(lines.map(icsFold).join('\r\n') + '\r\n');
+});
+
 // 首页的 Today's Whisper：今天的还没写好（凌晨之前）就先给最近一条
 app.get('/api/whispers/today', async (req, res) => {
   const { data, error } = await supabase
