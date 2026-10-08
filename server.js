@@ -939,7 +939,8 @@ function expandRepeating(e, from, to) {
     const occ = `${y}-${pad2(m)}-${pad2(baseDay)}`;
     if ((e.repeat === 'monthly' || m === baseMonth) && isDateStr(occ) && occ >= base && occ <= to && addDays(occ, span) >= from) {
       const shift = daysDiff(base, occ);
-      const inst = { ...e, instance: occ !== base, series_id: e.id, occurrence_date: occ };
+      // series_start_date/series_end_date 留着原始日期，前端编辑整个系列时用
+      const inst = { ...e, instance: occ !== base, series_id: e.id, occurrence_date: occ, series_start_date: e.start_date, series_end_date: e.end_date };
       if (e.all_day) Object.assign(inst, { start_date: occ, end_date: e.end_date ? addDays(occ, span) : null });
       else Object.assign(inst, { starts_at: shiftIso(e.starts_at, shift), ends_at: e.ends_at ? shiftIso(e.ends_at, shift) : null });
       out.push(inst);
