@@ -1144,15 +1144,16 @@ app.get('/api/whispers/today', async (req, res) => {
 });
 
 // === 待办 ===
+// todos 和 periods（健康数据）都要 APP 口令，和 /api/events 一样
 
-app.get('/api/todos', async (req, res) => {
+app.get('/api/todos', requireAppKey, async (req, res) => {
   const { data, error } = await supabase
     .from('todos').select('*').order('created_at', { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
-app.post('/api/todos', async (req, res) => {
+app.post('/api/todos', requireAppKey, async (req, res) => {
   const { side, text, due_time } = req.body;
   if (!text) return res.status(400).json({ error: 'missing text' });
   const { data, error } = await supabase
@@ -1161,7 +1162,7 @@ app.post('/api/todos', async (req, res) => {
   res.json(data);
 });
 
-app.put('/api/todos/:id', async (req, res) => {
+app.put('/api/todos/:id', requireAppKey, async (req, res) => {
   const { done, text, due_time } = req.body;
   const update = {};
   if (done !== undefined) update.done = done;
@@ -1173,7 +1174,7 @@ app.put('/api/todos/:id', async (req, res) => {
   res.json(data);
 });
 
-app.delete('/api/todos/:id', async (req, res) => {
+app.delete('/api/todos/:id', requireAppKey, async (req, res) => {
   const { error } = await supabase.from('todos').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
@@ -1181,14 +1182,14 @@ app.delete('/api/todos/:id', async (req, res) => {
 
 // === 经期 ===
 
-app.get('/api/periods', async (req, res) => {
+app.get('/api/periods', requireAppKey, async (req, res) => {
   const { data, error } = await supabase
     .from('periods').select('*').order('date', { ascending: false }).limit(90);
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
-app.post('/api/periods', async (req, res) => {
+app.post('/api/periods', requireAppKey, async (req, res) => {
   const { date } = req.body;
   if (!date) return res.status(400).json({ error: 'missing date' });
   const { data: existing } = await supabase
