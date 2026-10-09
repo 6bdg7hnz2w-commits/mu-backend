@@ -35,4 +35,10 @@ Module._load = function (req, ...rest) {
   if (req === 'node-cron') return { schedule: () => ({ stop() {} }) };
   return load.call(this, req, ...rest);
 };
-globalThis.fetch = async () => { throw new Error('network disabled in tests'); };
+// STUB_ALLOW_FETCH 开头的地址放行（测试里起的假 bridge），别的一律禁止出网
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (url, ...rest) => {
+  const allow = process.env.STUB_ALLOW_FETCH;
+  if (allow && String(url).startsWith(allow)) return realFetch(url, ...rest);
+  throw new Error('network disabled in tests');
+};

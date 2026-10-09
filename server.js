@@ -5,6 +5,7 @@ const { createClient } = require('@supabase/supabase-js');
 const OpenAI = require('openai');
 const multer = require('multer');
 const { makeRhythmStore } = require('./lib/rhythmStore');
+const { fetchFileTypes, checkFile } = require('./lib/ccFiles');
 const crypto = require('node:crypto');
 
 process.on('uncaughtException', (err) => {
@@ -19,7 +20,7 @@ const app = express();
 // 只允许自己的前端跨域调用。Render 上可以用 ALLOWED_ORIGINS（逗号分隔）覆盖默认值。
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://mu-frontend.onrender.com,http://localhost:5173')
   .split(',').map(s => s.trim()).filter(Boolean);
-app.use(cors({ origin: ALLOWED_ORIGINS, exposedHeaders: ['X-Audio-Duration'] }));
+app.use(cors({ origin: ALLOWED_ORIGINS, exposedHeaders: ['X-Audio-Duration', 'Content-Disposition'] }));
 app.use(express.json({ limit: '1mb' })); // /api/cc/history/import 一次会带几百条旧记录
 
 const upload = multer({
@@ -1703,27 +1704,34 @@ function bridgeConfig() {
   return url && token ? { url, token } : null;
 }
 
+// 图片 + 文件一次最多几个看白名单里的 max_items；白名单拉不到时按 9 算（bridge 那边还会再卡一次）
+const CC_MAX_ITEMS_FALLBACK = 9;
 app.post('/api/cc/send', requireAppKey, async (req, res) => {
   const bridge = bridgeConfig();
   if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
   const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
-  // images 是 /api/cc/upload 返回的 path，原样交给 bridge（bridge 会再校验一遍必须在 uploads 目录下）
-  const images = req.body?.images;
-  if (images !== undefined && (!Array.isArray(images) || images.length > 4 || !images.every(p => typeof p === 'string'))) {
-    return res.status(400).json({ error: 'images must be up to 4 paths' });
-  }
+  // images / files 是 /api/cc/upload 返回的 path，原样交给 bridge（bridge 会再校验一遍必须是它存下的文件）
+  const { images, files } = req.body || {};
+  const isPaths = (v) => v === undefined || (Array.isArray(v) && v.every(p => typeof p === 'string'));
+  if (!isPaths(images) || !isPaths(files)) return res.status(400).json({ error: 'images / files must be arrays of paths' });
   const hasImages = Array.isArray(images) && images.length > 0;
-  if (!text && !hasImages) return res.status(400).json({ error: 'text required' });
+  const hasFiles = Array.isArray(files) && files.length > 0;
+  const maxItems = (await fetchFileTypes(bridge).catch(() => null))?.max_items || CC_MAX_ITEMS_FALLBACK;
+  if ((images?.length || 0) + (files?.length || 0) > maxItems) {
+    return res.status(400).json({ error: `图片和文件一次合计最多 ${maxItems} 个` });
+  }
+  if (!text && !hasImages && !hasFiles) return res.status(400).json({ error: 'text required' });
   try {
     const r = await fetch(`${bridge.url}/send`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(hasImages ? { text, images } : { text }),
+      body: JSON.stringify({ text, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}) }),
       signal: AbortSignal.timeout(15000)
     });
     if (!r.ok) {
       console.error('CC bridge send failed:', r.status);
-      return res.status(r.status === 400 ? 400 : 502).json({ error: `bridge ${r.status}` });
+      const data = await r.json().catch(() => ({}));
+      return res.status(r.status === 400 ? 400 : 502).json({ error: r.status === 400 && data.error ? data.error : `bridge ${r.status}` });
     }
     const data = await r.json().catch(() => ({}));
     res.json({ ok: true, id: data.id, time: data.time });
@@ -1733,30 +1741,56 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
   }
 });
 
-// 图片上传：multipart 字段名 image，转成原始字节转发给 bridge /upload，返回 bridge 的 {id, path}
-const ccImageUpload = upload.single('image');
-app.post('/api/cc/upload', requireAppKey, (req, res) => {
-  ccImageUpload(req, res, async (uploadErr) => {
+// 图片和文件上传：multipart，字段名 image（图片，和以前一样）或 file（文件，白名单见 lib/ccFiles.js）
+// 文件的原名优先用表单字段 name（UTF-8 稳），没有再用 multipart 里的 filename。只收一个，转成原始字节给 bridge /upload
+const CC_IMAGE_MAX = 10 * 1024 * 1024;
+function ccUploadParser(maxBytes) {
+  return multer({
+    storage: multer.memoryStorage(),
+    defParamCharset: 'utf8',
+    limits: { fileSize: Math.max(maxBytes, CC_IMAGE_MAX), files: 1 },
+    fileFilter: (req, file, cb) => {
+      if (file.fieldname === 'image' && !file.mimetype.startsWith('image/')) return cb(new Error('Only image files are allowed'));
+      cb(null, true);
+    }
+  }).fields([{ name: 'image', maxCount: 1 }, { name: 'file', maxCount: 1 }]);
+}
+app.post('/api/cc/upload', requireAppKey, async (req, res) => {
+  const bridge = bridgeConfig();
+  if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+  // 白名单拉不到也不能耽误发图：这时只收图片
+  const types = await fetchFileTypes(bridge).catch(err => { console.error('CC file types error:', err.message); return null; });
+  const maxMb = Math.round((types?.max_bytes || CC_IMAGE_MAX) / 1024 / 1024);
+  ccUploadParser(types?.max_bytes || CC_IMAGE_MAX)(req, res, async (uploadErr) => {
     if (uploadErr) {
       const tooLarge = uploadErr.code === 'LIMIT_FILE_SIZE';
-      return res.status(tooLarge ? 413 : 400).json({ error: tooLarge ? 'image too large (max 10MB)' : uploadErr.message });
+      return res.status(tooLarge ? 413 : 400).json({ error: tooLarge ? `文件不能超过 ${maxMb}MB` : uploadErr.message });
     }
-    const bridge = bridgeConfig();
-    if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
-    if (!req.file) return res.status(400).json({ error: 'image required' });
+    const image = req.files?.image?.[0];
+    const file = req.files?.file?.[0];
+    if (!image && !file) return res.status(400).json({ error: 'image or file required' });
+    const headers = { 'Authorization': `Bearer ${bridge.token}` };
+    let body;
+    if (image) {
+      headers['Content-Type'] = image.mimetype;
+      body = image.buffer;
+    } else {
+      if (!types) return res.status(503).json({ error: '暂时拿不到文件类型白名单，稍后再试' });
+      const name = (typeof req.body?.name === 'string' && req.body.name.trim()) || file.originalname || '';
+      const bad = file.size > types.max_bytes ? `文件不能超过 ${maxMb}MB` : checkFile(types, { name, mime: file.mimetype, buffer: file.buffer });
+      if (bad) return res.status(file.size > types.max_bytes ? 413 : 415).json({ error: bad });
+      headers['Content-Type'] = file.mimetype || 'application/octet-stream';
+      headers['X-File-Name'] = encodeURIComponent(name);
+      body = file.buffer;
+    }
     try {
-      const r = await fetch(`${bridge.url}/upload`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': req.file.mimetype },
-        body: req.file.buffer,
-        signal: AbortSignal.timeout(30000)
-      });
+      const r = await fetch(`${bridge.url}/upload`, { method: 'POST', headers, body, signal: AbortSignal.timeout(60000) });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) {
         console.error('CC bridge upload failed:', r.status);
         return res.status([413, 415].includes(r.status) ? r.status : 502).json({ error: data.error || `bridge ${r.status}` });
       }
-      res.json({ id: data.id, path: data.path });
+      res.json(image ? { id: data.id, path: data.path } : { id: data.id, path: data.path, name: data.name, size: data.size, mime: data.mime });
     } catch (err) {
       console.error('CC bridge upload error:', err.message);
       res.status(502).json({ error: 'bridge unreachable' });
@@ -1764,7 +1798,21 @@ app.post('/api/cc/upload', requireAppKey, (req, res) => {
   });
 });
 
-// 回显：浏览器 <img> 带不了 Authorization，所以前端用 fetch 带口令取回再显示
+// 文件白名单给前端：限制选择器能选什么、单个多大、一次几个
+app.get('/api/cc/file-types', requireAppKey, async (req, res) => {
+  const bridge = bridgeConfig();
+  if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+  try {
+    const t = await fetchFileTypes(bridge);
+    res.json(t);
+  } catch (err) {
+    console.error('CC file types error:', err.message);
+    res.status(502).json({ error: 'bridge unreachable' });
+  }
+});
+
+// 回显：浏览器 <img> 带不了 Authorization，所以前端用 fetch 带口令取回再显示。
+// 文件的类型和原文件名在 bridge 的 Content-Type / Content-Disposition 里，原样带回去
 app.get('/api/cc/uploads/:date/:file', requireAppKey, async (req, res) => {
   const bridge = bridgeConfig();
   if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
@@ -1774,7 +1822,9 @@ app.get('/api/cc/uploads/:date/:file', requireAppKey, async (req, res) => {
       signal: AbortSignal.timeout(30000)
     });
     if (!r.ok) return res.status(r.status === 404 ? 404 : 502).json({ error: `bridge ${r.status}` });
-    res.set({ 'Content-Type': r.headers.get('content-type') || 'application/octet-stream', 'Cache-Control': 'private, max-age=86400' });
+    res.set({ 'Content-Type': r.headers.get('content-type') || 'application/octet-stream', 'Cache-Control': 'private, max-age=86400', 'X-Content-Type-Options': 'nosniff' });
+    const disposition = r.headers.get('content-disposition');
+    if (disposition) res.set('Content-Disposition', disposition);
     res.send(Buffer.from(await r.arrayBuffer()));
   } catch (err) {
     console.error('CC bridge uploads error:', err.message);
