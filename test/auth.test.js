@@ -38,17 +38,46 @@ const PROTECTED = [
   ['GET', '/api/periods'], ['POST', '/api/periods', { date: '2026-10-01' }],
   ['GET', '/api/events?from=2026-10-01&to=2026-10-31'], ['POST', '/api/events', {}], ['PUT', '/api/events/1', {}], ['DELETE', '/api/events/1'], ['POST', '/api/events/sync', {}],
   ['GET', '/api/letters'], ['POST', '/api/letters', {}], ['POST', '/api/letters/1/read'],
+  ['GET', '/api/settings'], ['PUT', '/api/settings', {}], ['POST', '/api/diaries/generate'], ['GET', '/api/auth/check'],
 ];
+// 输错口令有按 IP 的限速，每条用例换一个 X-Forwarded-For，互不影响
+let ipSeq = 0;
+const freshIp = () => ({ 'X-Forwarded-For': `10.0.0.${++ipSeq}` });
 for (const [method, p, body] of PROTECTED) {
   test(`${method} ${p.split('?')[0]} 不带口令 → 401`, async () => {
-    const r = await call(method, p, { headers: JSON_ONLY, body });
+    const r = await call(method, p, { headers: { ...JSON_ONLY, ...freshIp() }, body });
     assert.equal(r.status, 401);
   });
   test(`${method} ${p.split('?')[0]} 口令错 → 401`, async () => {
-    const r = await call(method, p, { headers: { ...JSON_ONLY, Authorization: 'Bearer wrong' }, body });
+    const r = await call(method, p, { headers: { ...JSON_ONLY, ...freshIp(), Authorization: 'Bearer wrong' }, body });
     assert.equal(r.status, 401);
   });
 }
+
+test('auth/check 带对口令 → 200', async () => {
+  assert.equal((await call('GET', '/api/auth/check', { headers: AUTH })).status, 200);
+});
+
+test('同一 IP 一分钟内输错 30 次后 → 429，口令对也不放；换个 IP 不受影响', async () => {
+  const ip = { 'X-Forwarded-For': '10.9.9.9, 10.1.1.1' };
+  for (let i = 0; i < 30; i++) {
+    assert.equal((await call('GET', '/api/auth/check', { headers: { ...ip, Authorization: 'Bearer wrong' } })).status, 401);
+  }
+  const blocked = await call('GET', '/api/auth/check', { headers: { ...AUTH, ...ip } });
+  assert.equal(blocked.status, 429);
+  assert.ok(Number(blocked.headers.get('retry-after')) > 0);
+  assert.equal((await call('GET', '/api/auth/check', { headers: { ...AUTH, 'X-Forwarded-For': '10.9.9.10' } })).status, 200);
+});
+
+test('CORS 预检放行 Authorization 头', async () => {
+  const r = await fetch(BASE + '/api/typing/ping', {
+    method: 'OPTIONS',
+    headers: { Origin: 'http://localhost:5173', 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'authorization,content-type' },
+  });
+  assert.ok(r.status === 204 || r.status === 200);
+  assert.equal(r.headers.get('access-control-allow-origin'), 'http://localhost:5173');
+  assert.match(r.headers.get('access-control-allow-headers') || '', /authorization/i);
+});
 
 test('todos 带口令：增、查、改、删都正常', async () => {
   const created = await (await call('POST', '/api/todos', { headers: AUTH, body: { side: 'her', text: '买牛奶', due_time: '2026-10-09' } })).json();

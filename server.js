@@ -184,13 +184,13 @@ app.put('/api/memories/:id', async (req, res) => {
 
 // === 设置 ===
 
-app.get('/api/settings', async (req, res) => {
+app.get('/api/settings', requireAppKey, async (req, res) => {
   const { data, error } = await supabase.from('settings').select('*').single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
-app.put('/api/settings', async (req, res) => {
+app.put('/api/settings', requireAppKey, async (req, res) => {
   const { data, error } = await supabase
     .from('settings').update(req.body).eq('id', 1).select().single();
   if (error) return res.status(500).json({ error: error.message });
@@ -748,7 +748,7 @@ app.delete('/api/diaries/:id', async (req, res) => {
 
 // 手动触发一次日记生成，方便测试；跟定时任务共用同一个函数，但这里不吞错误，
 // 好让调用方知道到底是哪一步(读消息/调模型/写库)失败了
-app.post('/api/diaries/generate', async (req, res) => {
+app.post('/api/diaries/generate', requireAppKey, async (req, res) => {
   if (!LEGACY_DIARY_GENERATION) return res.status(410).json({ error: 'legacy diary generation disabled' });
   try {
     const diary = await runDiaryGeneration();
@@ -1655,16 +1655,44 @@ app.post('/api/nook/books/:bookId/chapters/:num/ai-annotate', async (req, res) =
 // === 沐 (CC)：转发到 VPS 上的 Claude Code 中转 ===
 // BRIDGE_TOKEN 只在这里用，永远不下发给浏览器；浏览器这边用 APP_PASSCODE 鉴权。
 
+// 口令输错限速：同一 IP 每分钟最多错 AUTH_FAIL_LIMIT 次，超了这一分钟内一律 429（口令对也不放）。
+// 前端口令不对时会有一批请求同时 401，所以上限给宽一点，免得刚输对就被自己锁住。
+// IP 取 X-Forwarded-For 最左边那个（Render 在代理后面，req.socket 是代理的地址）；这个头客户端能伪造，
+// 所以它只是挡挡手滑和低级扫描，真正防爆破靠的是口令本身够长够随机。
+const AUTH_FAIL_LIMIT = 30;
+const AUTH_FAIL_WINDOW_MS = 60 * 1000;
+const authFails = new Map(); // ip → { count, resetAt }
+
+function clientIp(req) {
+  const xff = (req.get('x-forwarded-for') || '').split(',')[0].trim();
+  return xff || req.socket.remoteAddress || 'unknown';
+}
+
 function requireAppKey(req, res, next) {
   const expected = process.env.APP_PASSCODE;
   if (!expected) return res.status(503).json({ error: 'APP_PASSCODE not configured' });
+  const ip = clientIp(req);
+  const now = Date.now();
+  const fails = authFails.get(ip);
+  if (fails && now < fails.resetAt && fails.count >= AUTH_FAIL_LIMIT) {
+    res.set('Retry-After', String(Math.ceil((fails.resetAt - now) / 1000)));
+    return res.status(429).json({ error: 'too many attempts' });
+  }
   const got = (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
   // 先各自哈希成等长再比较，timingSafeEqual 要求长度一致，也避免泄露口令长度
   const a = crypto.createHash('sha256').update(got).digest();
   const b = crypto.createHash('sha256').update(expected).digest();
-  if (!got || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: 'unauthorized' });
+  if (!got || !crypto.timingSafeEqual(a, b)) {
+    if (!fails || now >= fails.resetAt) authFails.set(ip, { count: 1, resetAt: now + AUTH_FAIL_WINDOW_MS });
+    else fails.count++;
+    if (authFails.size > 1000) for (const [k, v] of authFails) if (now >= v.resetAt) authFails.delete(k);
+    return res.status(401).json({ error: 'unauthorized' });
+  }
   next();
 }
+
+// 前端锁屏输完口令先打这里验一下，对了才进 App
+app.get('/api/auth/check', requireAppKey, (req, res) => res.json({ ok: true }));
 
 function bridgeConfig() {
   const url = (process.env.BRIDGE_URL || '').replace(/\/+$/, '');
