@@ -108,14 +108,14 @@ app.get('/health', (req, res) => {
 
 // === 会话 ===
 
-app.get('/api/sessions', async (req, res) => {
+app.get('/api/sessions', requireAppKey, async (req, res) => {
   const { data, error } = await supabase
     .from('sessions').select('*').order('updated_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
-app.post('/api/sessions', async (req, res) => {
+app.post('/api/sessions', requireAppKey, async (req, res) => {
   const { name, model } = req.body;
   const { data, error } = await supabase
     .from('sessions').insert({ name: name || '新对话', model: model || 'opus' }).select().single();
@@ -123,14 +123,14 @@ app.post('/api/sessions', async (req, res) => {
   res.json(data);
 });
 
-app.delete('/api/sessions/:id', async (req, res) => {
+app.delete('/api/sessions/:id', requireAppKey, async (req, res) => {
   await supabase.from('messages').delete().eq('session_id', req.params.id);
   const { error } = await supabase.from('sessions').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
 
-app.get('/api/sessions/:id/messages', async (req, res) => {
+app.get('/api/sessions/:id/messages', requireAppKey, async (req, res) => {
   const { data, error } = await supabase
     .from('messages').select('*')
     .eq('session_id', req.params.id)
@@ -142,7 +142,7 @@ app.get('/api/sessions/:id/messages', async (req, res) => {
 
 // === 记忆 ===
 
-app.get('/api/memories', async (req, res) => {
+app.get('/api/memories', requireAppKey, async (req, res) => {
   const { data, error } = await supabase
     .from('memories').select('*')
     .order('timestamp', { ascending: false }).limit(100);
@@ -154,7 +154,7 @@ app.get('/api/memories', async (req, res) => {
 // that can't otherwise reach this project. Stores raw text, no compression,
 // so nothing gets lost. Feeds into the same shared memory pool used by
 // both Claude and DeepSeek in /api/chat.
-app.post('/api/memories/import', async (req, res) => {
+app.post('/api/memories/import', requireAppKey, async (req, res) => {
   const { content } = req.body;
   if (!content || !content.trim()) return res.status(400).json({ error: 'missing content' });
   const { data, error } = await supabase.from('memories').insert({
@@ -167,13 +167,13 @@ app.post('/api/memories/import', async (req, res) => {
   res.json(data);
 });
 
-app.delete('/api/memories/:id', async (req, res) => {
+app.delete('/api/memories/:id', requireAppKey, async (req, res) => {
   const { error } = await supabase.from('memories').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
 
-app.put('/api/memories/:id', async (req, res) => {
+app.put('/api/memories/:id', requireAppKey, async (req, res) => {
   const { summary } = req.body;
   if (!summary) return res.status(400).json({ error: 'missing summary' });
   const { data, error } = await supabase
@@ -200,7 +200,7 @@ app.put('/api/settings', requireAppKey, async (req, res) => {
 // === 打字节奏 ===
 // 前端探针每隔几秒ping一次，只上报"正在打字"这个事实，不携带任何内容。
 
-app.post('/api/typing/ping', async (req, res) => {
+app.post('/api/typing/ping', requireAppKey, async (req, res) => {
   try {
     await rhythmStore.ping();
     res.json({ ok: true });
@@ -212,7 +212,7 @@ app.post('/api/typing/ping', async (req, res) => {
 
 // === 图片上传 ===
 
-app.post('/api/upload', (req, res) => {
+app.post('/api/upload', requireAppKey, (req, res) => {
   upload.single('file')(req, res, async (uploadErr) => {
     if (uploadErr) return res.status(400).json({ error: uploadErr.message });
     if (!req.file) return res.status(400).json({ error: 'missing file' });
@@ -370,7 +370,7 @@ async function compressMemory(sessionId, messages, settings) {
   }
 }
 
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', requireAppKey, async (req, res) => {
   const { session_id, message, model, extended_thinking, image_url } = req.body;
   if (!session_id || (!message && !image_url)) return res.status(400).json({ error: 'missing fields' });
 
@@ -600,10 +600,13 @@ ${memoryContext}
 }
 
 const cron = require('node-cron');
-cron.schedule('* * * * *', runConsciousnessCheck);
+// API 版意识循环默认关（沐的主动消息现在由 VPS 上的心跳负责）；CONSCIOUSNESS_LOOP=1 才每分钟跑
+if (process.env.CONSCIOUSNESS_LOOP === '1') {
+  cron.schedule('* * * * *', runConsciousnessCheck);
+}
 
-// 供外部cron服务(cron-job.org)唤醒Render免费版用的接口，顺便也能手动触发测试
-app.get('/api/consciousness/trigger', async (req, res) => {
+// 手动触发一次意识循环（测试用，要口令）；cron-job.org 唤醒 Render 现在改打 /health
+app.get('/api/consciousness/trigger', requireAppKey, async (req, res) => {
   await runConsciousnessCheck();
   res.json({ ok: true });
 });
@@ -714,7 +717,7 @@ app.get('/api/mochi/mood', async (req, res) => {
 
 // === 日记 ===
 
-app.get('/api/diaries', async (req, res) => {
+app.get('/api/diaries', requireAppKey, async (req, res) => {
   const { data, error } = await supabase
     .from('diaries').select('*')
     .order('created_at', { ascending: false }).limit(100);
@@ -722,7 +725,7 @@ app.get('/api/diaries', async (req, res) => {
   res.json(data);
 });
 
-app.post('/api/diaries', async (req, res) => {
+app.post('/api/diaries', requireAppKey, async (req, res) => {
   const { author, content } = req.body;
   if (!author || !content) return res.status(400).json({ error: 'missing fields' });
   const { data, error } = await supabase
@@ -731,7 +734,7 @@ app.post('/api/diaries', async (req, res) => {
   res.json(data);
 });
 
-app.put('/api/diaries/:id', async (req, res) => {
+app.put('/api/diaries/:id', requireAppKey, async (req, res) => {
   const { content } = req.body;
   if (!content) return res.status(400).json({ error: 'missing content' });
   const { data, error } = await supabase
@@ -740,7 +743,7 @@ app.put('/api/diaries/:id', async (req, res) => {
   res.json(data);
 });
 
-app.delete('/api/diaries/:id', async (req, res) => {
+app.delete('/api/diaries/:id', requireAppKey, async (req, res) => {
   const { error } = await supabase.from('diaries').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
@@ -1129,7 +1132,7 @@ app.get('/api/calendar.ics', async (req, res) => {
 });
 
 // 首页的 Today's Whisper：今天的还没写好（凌晨之前）就先给最近一条
-app.get('/api/whispers/today', async (req, res) => {
+app.get('/api/whispers/today', requireAppKey, async (req, res) => {
   const { data, error } = await supabase
     .from('whispers').select('date, content')
     .lte('date', beijingToday())
@@ -1298,7 +1301,7 @@ async function statTtsCache(objectPath) {
   return hit?.metadata?.size ?? null;
 }
 
-app.post('/api/tts', async (req, res) => {
+app.post('/api/tts', requireAppKey, async (req, res) => {
   let { text, preset } = req.body;
   if (!text || !text.trim()) return res.status(400).json({ error: 'missing text' });
 
@@ -1349,7 +1352,7 @@ app.post('/api/tts', async (req, res) => {
   }
 });
 
-app.get('/api/tts/duration', async (req, res) => {
+app.get('/api/tts/duration', requireAppKey, async (req, res) => {
   let { text, preset } = req.query;
   if (!text || !text.trim()) return res.status(400).json({ error: 'missing text' });
 
@@ -1365,7 +1368,7 @@ app.get('/api/tts/duration', async (req, res) => {
 
 // === 游戏：你画我猜 ===
 
-app.post('/api/games/draw-guess/start', async (req, res) => {
+app.post('/api/games/draw-guess/start', requireAppKey, async (req, res) => {
   try {
     const prompt = '你是一个"你画我猜"游戏的出题人。请随机想一个适合手绘涂鸦的具体名词，比如动物、日常物品、简单场景等，不要太抽象。只输出这个词本身，不要输出任何其他文字、标点或解释。';
     const response = await deepseek.chat.completions.create({
@@ -1382,7 +1385,7 @@ app.post('/api/games/draw-guess/start', async (req, res) => {
   }
 });
 
-app.post('/api/games/draw-guess/guess', async (req, res) => {
+app.post('/api/games/draw-guess/guess', requireAppKey, async (req, res) => {
   const { image, word } = req.body;
   if (!image) return res.status(400).json({ error: 'missing image' });
   try {
@@ -1460,14 +1463,14 @@ const NOOK_ANNOTATE_PROMPT = `你是沐，在自己先读这一章。挑1到3处
 
 只输出JSON数组本身，不要有其他文字或代码块标记。如果整章都没有特别想划的地方，输出空数组 []。`;
 
-app.get('/api/nook/books', async (req, res) => {
+app.get('/api/nook/books', requireAppKey, async (req, res) => {
   const { data, error } = await supabase
     .from('nook_books').select('*').order('created_at', { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
-app.get('/api/nook/books/:id/chapters', async (req, res) => {
+app.get('/api/nook/books/:id/chapters', requireAppKey, async (req, res) => {
   const { data, error } = await supabase
     .from('nook_chapters').select('chapter_number, title')
     .eq('book_id', req.params.id).order('chapter_number', { ascending: true });
@@ -1475,7 +1478,7 @@ app.get('/api/nook/books/:id/chapters', async (req, res) => {
   res.json(data);
 });
 
-app.get('/api/nook/books/:id/chapters/:num', async (req, res) => {
+app.get('/api/nook/books/:id/chapters/:num', requireAppKey, async (req, res) => {
   const { data, error } = await supabase
     .from('nook_chapters').select('*')
     .eq('book_id', req.params.id).eq('chapter_number', req.params.num).single();
@@ -1483,7 +1486,7 @@ app.get('/api/nook/books/:id/chapters/:num', async (req, res) => {
   res.json(data);
 });
 
-app.get('/api/nook/progress/:bookId', async (req, res) => {
+app.get('/api/nook/progress/:bookId', requireAppKey, async (req, res) => {
   const { data, error } = await supabase
     .from('nook_progress').select('*').eq('book_id', req.params.bookId);
   if (error) return res.status(500).json({ error: error.message });
@@ -1492,7 +1495,7 @@ app.get('/api/nook/progress/:bookId', async (req, res) => {
 
 // 沐没有真的"翻页阅读"，它的进度是它读过、留下划线的最后一章——
 // 跟 nook_progress（只记桦桦真实滚动的进度）分开算，不混在一起。
-app.get('/api/nook/books/:id/ai-progress', async (req, res) => {
+app.get('/api/nook/books/:id/ai-progress', requireAppKey, async (req, res) => {
   const { data, error } = await supabase
     .from('nook_chapters').select('chapter_number')
     .eq('book_id', req.params.id).eq('ai_annotated', true)
@@ -1501,7 +1504,7 @@ app.get('/api/nook/books/:id/ai-progress', async (req, res) => {
   res.json({ chapter: data ? data.chapter_number : null });
 });
 
-app.post('/api/nook/progress', async (req, res) => {
+app.post('/api/nook/progress', requireAppKey, async (req, res) => {
   const { book_id, who, chapter, paragraph } = req.body;
   if (!book_id || !who || chapter === undefined || paragraph === undefined) {
     return res.status(400).json({ error: 'missing fields' });
@@ -1514,7 +1517,7 @@ app.post('/api/nook/progress', async (req, res) => {
   res.json(data);
 });
 
-app.get('/api/nook/annotations/:bookId/:chapter', async (req, res) => {
+app.get('/api/nook/annotations/:bookId/:chapter', requireAppKey, async (req, res) => {
   const { data: annotations, error } = await supabase
     .from('nook_annotations').select('*')
     .eq('book_id', req.params.bookId).eq('chapter', req.params.chapter)
@@ -1538,7 +1541,7 @@ app.get('/api/nook/annotations/:bookId/:chapter', async (req, res) => {
   res.json(result);
 });
 
-app.post('/api/nook/annotations', async (req, res) => {
+app.post('/api/nook/annotations', requireAppKey, async (req, res) => {
   const { book_id, chapter, anchor_para, anchor_quote, who } = req.body;
   if (!book_id || chapter === undefined || anchor_para === undefined || !anchor_quote || !who) {
     return res.status(400).json({ error: 'missing fields' });
@@ -1551,7 +1554,7 @@ app.post('/api/nook/annotations', async (req, res) => {
   res.json({ ...data, floors: [] });
 });
 
-app.post('/api/nook/annotations/:id/floors', async (req, res) => {
+app.post('/api/nook/annotations/:id/floors', requireAppKey, async (req, res) => {
   const { who, text } = req.body;
   if (!who || !text) return res.status(400).json({ error: 'missing fields' });
   const { data, error } = await supabase
@@ -1566,7 +1569,7 @@ app.post('/api/nook/annotations/:id/floors', async (req, res) => {
   }
 });
 
-app.put('/api/nook/floors/:id', async (req, res) => {
+app.put('/api/nook/floors/:id', requireAppKey, async (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: 'missing text' });
   const { data, error } = await supabase
@@ -1578,20 +1581,20 @@ app.put('/api/nook/floors/:id', async (req, res) => {
   res.json(data);
 });
 
-app.delete('/api/nook/floors/:id', async (req, res) => {
+app.delete('/api/nook/floors/:id', requireAppKey, async (req, res) => {
   const { error } = await supabase.from('nook_annotation_floors').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
 
-app.delete('/api/nook/annotations/:id', async (req, res) => {
+app.delete('/api/nook/annotations/:id', requireAppKey, async (req, res) => {
   await supabase.from('nook_annotation_floors').delete().eq('annotation_id', req.params.id);
   const { error } = await supabase.from('nook_annotations').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
 
-app.post('/api/nook/books/:bookId/chapters/:num/ai-annotate', async (req, res) => {
+app.post('/api/nook/books/:bookId/chapters/:num/ai-annotate', requireAppKey, async (req, res) => {
   try {
     const { data: chapterRow } = await supabase
       .from('nook_chapters').select('id, content, ai_annotated')
