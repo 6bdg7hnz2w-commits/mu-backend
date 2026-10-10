@@ -50,6 +50,7 @@ const PROTECTED = [
   ['POST', '/api/nook/annotations/1/floors', {}], ['PUT', '/api/nook/floors/1', {}], ['DELETE', '/api/nook/floors/1'], ['DELETE', '/api/nook/annotations/1'],
   ['POST', '/api/nook/books/1/chapters/1/ai-annotate'],
   ['POST', '/api/cc/send', { text: 'x' }], ['POST', '/api/cc/upload'], ['GET', '/api/cc/file-types'], ['GET', '/api/cc/uploads/2026-10-09/x.pdf'], ['GET', '/api/cc/history'],
+  ['POST', '/api/cc/edit', { id: 'm1', text: 'x' }], ['POST', '/api/cc/retry', { id: 'm1' }], ['GET', '/api/cc/history?system=1'],
 ];
 // 输错口令有按 IP 的限速，每条用例换一个 X-Forwarded-For，互不影响
 let ipSeq = 0;

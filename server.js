@@ -1706,6 +1706,10 @@ function bridgeConfig() {
 
 // 图片 + 文件一次最多几个看白名单里的 max_items；白名单拉不到时按 9 算（bridge 那边还会再卡一次）
 const CC_MAX_ITEMS_FALLBACK = 9;
+// 前端给每条消息的 client_id、消息 id：后端只卡类型和长度，去重、找消息都是 bridge 的事
+const CC_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const isCcId = (v) => typeof v === 'string' && CC_ID_RE.test(v);
+const CC_EDIT_MAX = 20000;
 app.post('/api/cc/send', requireAppKey, async (req, res) => {
   const bridge = bridgeConfig();
   if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
@@ -1721,11 +1725,13 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
     return res.status(400).json({ error: `图片和文件一次合计最多 ${maxItems} 个` });
   }
   if (!text && !hasImages && !hasFiles) return res.status(400).json({ error: 'text required' });
+  const clientId = req.body?.client_id;
+  if (clientId !== undefined && !isCcId(clientId)) return res.status(400).json({ error: 'client_id must be 1-64 letters, digits, - or _' });
   try {
     const r = await fetch(`${bridge.url}/send`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}) }),
+      body: JSON.stringify({ text, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}), ...(clientId ? { client_id: clientId } : {}) }),
       signal: AbortSignal.timeout(15000)
     });
     if (!r.ok) {
@@ -1739,6 +1745,45 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
     console.error('CC bridge send error:', err.message);
     res.status(502).json({ error: 'bridge unreachable' });
   }
+});
+
+// 带 BRIDGE_TOKEN 把 JSON POST 给 bridge；bridge 的 400/404/409（参数不对、找不到、不用重发）原样回给前端，别的算 502
+async function forwardCcPost(res, path, body) {
+  const bridge = bridgeConfig();
+  if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+  try {
+    const r = await fetch(`${bridge.url}${path}`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15000)
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      console.error(`CC bridge ${path} failed:`, r.status);
+      return res.status([400, 404, 409].includes(r.status) ? r.status : 502).json({ error: data.error || `bridge ${r.status}` });
+    }
+    res.json(data);
+  } catch (err) {
+    console.error(`CC bridge ${path} error:`, err.message);
+    res.status(502).json({ error: 'bridge unreachable' });
+  }
+}
+
+// 更正她发过的一条文字：bridge 留原话、推更新、通知沐
+app.post('/api/cc/edit', requireAppKey, (req, res) => {
+  const { id, text } = req.body || {};
+  if (!isCcId(id)) return res.status(400).json({ error: 'id required' });
+  if (typeof text !== 'string' || !text.trim()) return res.status(400).json({ error: 'text required' });
+  if (text.length > CC_EDIT_MAX) return res.status(400).json({ error: `text too long (max ${CC_EDIT_MAX})` });
+  return forwardCcPost(res, '/edit', { id, text: text.trim() });
+});
+
+// 沐那一轮没回上来：把她那条再交给沐一次（不新增她的消息）
+app.post('/api/cc/retry', requireAppKey, (req, res) => {
+  const id = req.body?.id;
+  if (!isCcId(id)) return res.status(400).json({ error: 'id required' });
+  return forwardCcPost(res, '/retry', { id });
 });
 
 // 图片和文件上传：multipart，字段名 image（图片，和以前一样）或 file（文件，白名单见 lib/ccFiles.js）
@@ -1839,6 +1884,7 @@ app.get('/api/cc/history', requireAppKey, async (req, res) => {
   const qs = new URLSearchParams();
   if (typeof req.query.before === 'string') qs.set('before', req.query.before);
   if (typeof req.query.limit === 'string') qs.set('limit', req.query.limit);
+  if (req.query.system === '1') qs.set('system', '1'); // 新前端要系统事件（"他这次没回上来"）
   try {
     const r = await fetch(`${bridge.url}/history?${qs}`, {
       headers: { 'Authorization': `Bearer ${bridge.token}` },
