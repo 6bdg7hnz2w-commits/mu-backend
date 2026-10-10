@@ -1,4 +1,4 @@
-// 测试桩（node -r 预加载）：假的 Supabase（每张表一个内存数组）、cron 不跑、禁止出网。
+// 测试桩（node -r 预加载）：假的 Supabase（每张表一个内存数组）、禁止出网。
 // 只模拟鉴权测试用得到的那几种链式调用，不求和真库行为一致
 const Module = require('module');
 
@@ -32,7 +32,6 @@ const fake = { from: builder, storage: { from: () => ({}) }, channel: () => ({ o
 const load = Module._load;
 Module._load = function (req, ...rest) {
   if (req === '@supabase/supabase-js') return { createClient: () => fake };
-  if (req === 'node-cron') return { schedule: () => ({ stop() {} }) };
   return load.call(this, req, ...rest);
 };
 // STUB_ALLOW_FETCH 开头的地址放行（测试里起的假 bridge），别的一律禁止出网

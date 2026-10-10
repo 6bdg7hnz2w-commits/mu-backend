@@ -325,11 +325,10 @@ async function compressMemory(sessionId, messages, settings) {
   if (messages.length <= keepCount) return;
 
   const toCompress = messages.slice(0, messages.length - keepCount);
-  const toCompressFiltered = toCompress.filter(m => m.generated_by !== 'consciousness_loop_deepseek');
   const compressPrompt = '你是一个记忆压缩助手。请将对话压缩成简短的记忆摘要，保留关键信息、情感和重要细节，用第三人称描述。';
   const compressMessages = [{
     role: 'user',
-    content: '请压缩以下对话：\n\n' + toCompressFiltered.map(m => m.role + ': ' + m.content).join('\n')
+    content: '请压缩以下对话：\n\n' + toCompress.map(m => m.role + ': ' + m.content).join('\n')
   }];
 
   try {
@@ -340,7 +339,7 @@ async function compressMemory(sessionId, messages, settings) {
       conversation_id: String(sessionId),
       timestamp: new Date().toISOString()
     });
-    const ids = toCompressFiltered.map(m => m.id);
+    const ids = toCompress.map(m => m.id);
     await supabase.from('messages').update({ visible: false }).in('id', ids);
     console.log('Compressed ' + toCompress.length + ' messages');
   } catch (err) {

@@ -1,5 +1,5 @@
 // 鉴权测试：npm test
-// 起一个真的 server.js 子进程（Supabase/cron/出网都换成桩，见 helpers/stub.js），在临时目录里跑，不读仓库的 .env
+// 起一个真的 server.js 子进程（Supabase/出网都换成桩，见 helpers/stub.js），在临时目录里跑，不读仓库的 .env
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
