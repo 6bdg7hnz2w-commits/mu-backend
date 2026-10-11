@@ -1427,6 +1427,8 @@ const CC_MAX_ITEMS_FALLBACK = 9;
 const CC_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const isCcId = (v) => typeof v === 'string' && CC_ID_RE.test(v);
 const CC_EDIT_MAX = 20000;
+// 消息类型：普通聊天 chat 不加标签；以后的共读批注、你画我猜放开时在这里和 bridge 两边加上
+const CC_KINDS = new Set(['chat']);
 app.post('/api/cc/send', requireAppKey, async (req, res) => {
   const bridge = bridgeConfig();
   if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
@@ -1444,11 +1446,13 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
   if (!text && !hasImages && !hasFiles) return res.status(400).json({ error: 'text required' });
   const clientId = req.body?.client_id;
   if (clientId !== undefined && !isCcId(clientId)) return res.status(400).json({ error: 'client_id must be 1-64 letters, digits, - or _' });
+  const kind = req.body?.kind ?? 'chat';
+  if (!CC_KINDS.has(kind)) return res.status(400).json({ error: `kind must be one of ${[...CC_KINDS].join(', ')}` });
   try {
     const r = await fetch(`${bridge.url}/send`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}), ...(clientId ? { client_id: clientId } : {}) }),
+      body: JSON.stringify({ text, kind, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}), ...(clientId ? { client_id: clientId } : {}) }),
       signal: AbortSignal.timeout(15000)
     });
     if (!r.ok) {
@@ -1457,7 +1461,7 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
       return res.status(r.status === 400 ? 400 : 502).json({ error: r.status === 400 && data.error ? data.error : `bridge ${r.status}` });
     }
     const data = await r.json().catch(() => ({}));
-    res.json({ ok: true, id: data.id, time: data.time });
+    res.json({ ok: true, id: data.id, time: data.time, ...(Number.isSafeInteger(data.seq) ? { seq: data.seq } : {}) });
   } catch (err) {
     console.error('CC bridge send error:', err.message);
     res.status(502).json({ error: 'bridge unreachable' });

@@ -144,13 +144,13 @@ test('send：图片 + 文件合计 9 个 → 转给 bridge', async () => {
   const body = { text: '看看', images: Array(4).fill('/u/i.jpg'), files: Array(5).fill('/u/f.pdf') };
   const r = await fetch(`${BASE}/api/cc/send`, { method: 'POST', headers: { ...AUTH, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   assert.equal(r.status, 200);
-  assert.deepEqual(JSON.parse(lastTo('/send').body), body);
+  assert.deepEqual(JSON.parse(lastTo('/send').body), { ...body, kind: 'chat' });
 });
 
 test('send：只有图片时发给 bridge 的内容和以前一样（没有 files 字段）', async () => {
-  const r = await fetch(`${BASE}/api/cc/send`, { method: 'POST', headers: { ...AUTH, 'Content-Type': 'application/json' }, body: JSON.stringify({ text: 'hi', images: ['/u/i.jpg'] }) });
+  const r = await fetch(`${BASE}/api/cc/send`, { method: 'POST', headers: { ...AUTH, 'Content-Type': 'application/json' }, body: JSON.stringify({ text: 'hi', kind: 'chat', images: ['/u/i.jpg'] }) });
   assert.equal(r.status, 200);
-  assert.deepEqual(JSON.parse(lastTo('/send').body), { text: 'hi', images: ['/u/i.jpg'] });
+  assert.deepEqual(JSON.parse(lastTo('/send').body), { text: 'hi', kind: 'chat', images: ['/u/i.jpg'] });
 });
 
 test('send：合计 10 个 → 400', async () => {

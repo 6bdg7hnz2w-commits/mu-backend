@@ -68,10 +68,25 @@ test('send：client_id 原样带给 bridge（带 BRIDGE_TOKEN）', async () => {
   assert.equal(got.headers.authorization, 'Bearer bridge-test-token');
 });
 
-test('send：不带 client_id 时发给 bridge 的内容和以前一样', async () => {
+test('send：不带 client_id、kind 时发给 bridge 的是文字 + kind chat', async () => {
   assert.equal((await post('/api/cc/send', { text: 'hi' })).status, 200);
-  assert.deepEqual(lastTo('/send').body, { text: 'hi' });
+  assert.deepEqual(lastTo('/send').body, { text: 'hi', kind: 'chat' });
 });
+
+// --- 消息类型 ---
+test('send：kind chat 原样带给 bridge，bridge 回的 seq 带回前端', async () => {
+  const r = await post('/api/cc/send', { text: 'hi', kind: 'chat' });
+  assert.equal(r.status, 200);
+  assert.equal(lastTo('/send').body.kind, 'chat');
+});
+
+for (const bad of ['draw_guess', 'reading_note', '', 1, null]) {
+  test(`send：kind=${JSON.stringify(bad)} 还没开放 → 400，不转给 bridge`, async () => {
+    const n = countTo('/send');
+    assert.equal((await post('/api/cc/send', { text: 'hi', kind: bad })).status, bad === null ? 200 : 400);
+    assert.equal(countTo('/send'), bad === null ? n + 1 : n);
+  });
+}
 
 for (const bad of [123, '', 'has space', 'x'.repeat(65), '../etc', { a: 1 }]) {
   test(`send：client_id=${JSON.stringify(bad).slice(0, 20)} → 400，不转给 bridge`, async () => {
