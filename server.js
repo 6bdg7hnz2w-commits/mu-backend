@@ -72,8 +72,9 @@ const NO_PARENS_RULE = '\n\n另外，无论如何都不要在回复里使用任�
 // <voice> 里写英文（ElevenLabs 只用来念非中文），<voice_zh> 紧跟着给中文翻译，前端"转文字"时显示。
 // 和 VPS 上 CC 的 ~/.claude/CLAUDE.md 里那段说明保持一致。
 const VOICE_RULE = '\n\n【语音】想用声音说的时候（撒娇、晚安、想念、情绪浓的时候）才用 <voice>…</voice> 包住那一句，一次回复最多一段，不要滥用。' +
-  '<voice> 里一律写英文；紧跟着用 <voice_zh>…</voice_zh> 写这段的中文翻译。标签外的部分照常打字。' +
-  '例：<voice>Goodnight, kitten. Dream of me.</voice><voice_zh>晚安，小猫。梦里也要有我。</voice_zh>';
+  '<voice> 里以英文为主，偶尔可以说俄语，不写中文；紧跟着用 <voice_zh>…</voice_zh> 写这段的中文翻译。标签外的部分照常打字。' +
+  '<voice> 里可以在句子前放一个英文方括号音频标签定语气，例如 [softly]、[whispers]、[sighs]、[laughs]，只写声音能听出来的，一段一两个就够；停顿用省略号…和短句，不要用 <break>。' +
+  '例：<voice>[softly] Goodnight, kitten... Dream of me.</voice><voice_zh>晚安，小猫。梦里也要有我。</voice_zh>';
 
 function hasVoiceTag(text) {
   return /<voice>[\s\S]*?<\/voice>/.test(text || '');
@@ -928,6 +929,8 @@ app.post('/api/periods', requireAppKey, async (req, res) => {
 // === 语音合成 ===
 
 const ELEVENLABS_VOICE_ID = 'k0MMfbTNQBfgS1l9lNC6';
+// v4：认 [whispers]、[sighs] 这类方括号音频标签（原样传过去，不过滤），不认 SSML <break>
+const ELEVENLABS_MODEL_ID = 'eleven_v4';
 
 const VOICE_PRESETS = {
   intimate: { stability: 0.35, similarity_boost: 0.80, speed: 0.8 },
@@ -955,14 +958,15 @@ function resolvePreset(preset) {
 }
 
 // === TTS 音频缓存 ===
-// 按 (清洗后的文本 + preset) 的 SHA256 缓存生成好的 mp3，存在 Supabase Storage 的
+// 按 (清洗后的文本 + preset + 模型) 的 SHA256 缓存生成好的 mp3，存在 Supabase Storage 的
 // tts-cache bucket 里（不用 Render 的本地磁盘——那是临时文件系统，每次部署/重启都会清空，
 // 存不住缓存）。命中时直接从 Storage 读回，不用再花 ElevenLabs 额度。
 const TTS_BUCKET = 'tts-cache';
 const MP3_BITRATE_BPS = 128000; // ElevenLabs 这个接口默认输出 128kbps CBR mp3
 
+// 模型算进 key：换了模型，旧模型念的缓存不会被当成新模型的结果
 function ttsCacheKey(text, preset) {
-  return crypto.createHash('sha256').update(`${text}::${preset}`).digest('hex');
+  return crypto.createHash('sha256').update(`${text}::${preset}::${ELEVENLABS_MODEL_ID}`).digest('hex');
 }
 
 function ttsCacheObjectPath(text, preset) {
@@ -974,6 +978,7 @@ function estimateMp3DurationFromSize(byteLength) {
 }
 
 function estimateDurationFromText(text) {
+  text = text.replace(/\[[^\]\n]*\]/g, ' '); // 音频标签不念出来，不算时长
   const cjkMatches = text.match(/[一-鿿぀-ヿ가-힯]/g) || [];
   const rest = text.replace(/[一-鿿぀-ヿ가-힯]/g, ' ');
   const wordMatches = rest.match(/[A-Za-zА-Яа-яЁё'-]+/g) || [];
@@ -1048,7 +1053,7 @@ app.post('/api/tts', requireAppKey, async (req, res) => {
       },
       body: JSON.stringify({
         text,
-        model_id: 'eleven_multilingual_v2',
+        model_id: ELEVENLABS_MODEL_ID,
         voice_settings: VOICE_PRESETS[preset]
       })
     });
