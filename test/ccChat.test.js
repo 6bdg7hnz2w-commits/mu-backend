@@ -28,6 +28,7 @@ before(async () => {
       if (req.url === '/file-types') return send(200, { max_bytes: 1024, max_items: 9, types: [] });
       if (req.url === '/send') return send(200, { ok: true, id: 'm1', time: '2026-10-10T10:00:00+08:00' });
       if (req.url.startsWith('/history')) return send(200, { messages: [], has_more: false });
+      if (req.url.startsWith('/usage')) return send(200, { context_tokens: 88000, days: [], hours: [] });
       if (req.url === '/edit') {
         if (body.id === 'missing') return send(404, { error: '找不到这条消息' });
         return send(200, { ok: true, message: { id: body.id, role: 'user', text: body.text, time: '2026-10-10T10:00:00+08:00', edited_at: '2026-10-10T10:05:00+08:00' }, notified: true });
@@ -150,6 +151,25 @@ test('history：system=1 透传给 bridge，别的值不透传', async () => {
   assert.match(lastHistory(), /[?&]system=1(&|$)/);
   await fetch(`${BASE}/api/cc/history?limit=30&system=yes`, { headers: AUTH });
   assert.doesNotMatch(lastHistory(), /system/);
+});
+
+test('usage：brief/days/hours 透传给 bridge，别的参数和非数字不透传', async () => {
+  const lastUsage = () => [...seen].reverse().find((r) => r.url.startsWith('/usage')).url;
+  const r = await fetch(`${BASE}/api/cc/usage?brief=1`, { headers: AUTH });
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).context_tokens, 88000);
+  assert.equal(lastUsage(), '/usage?brief=1');
+  await fetch(`${BASE}/api/cc/usage?days=30&hours=48&x=1`, { headers: AUTH });
+  assert.equal(lastUsage(), '/usage?days=30&hours=48');
+  await fetch(`${BASE}/api/cc/usage?days=abc&hours=1e9&brief=yes`, { headers: AUTH });
+  assert.equal(lastUsage(), '/usage?');
+});
+
+test('usage 不带口令 → 401，不会转给 bridge', async () => {
+  const n = seen.length;
+  const r = await fetch(`${BASE}/api/cc/usage?brief=1`, { headers: { 'X-Forwarded-For': '10.7.7.8' } });
+  assert.equal(r.status, 401);
+  assert.equal(seen.length, n);
 });
 
 test('新路由不带口令 → 401，不会转给 bridge', async () => {

@@ -1625,6 +1625,27 @@ app.get('/api/cc/history', requireAppKey, async (req, res) => {
   }
 });
 
+// 额度消耗：聊天页只要 brief=1（上下文多大、额度几点恢复），Usage 页要按天、按小时的统计。只透传这三个参数，而且只收数字
+app.get('/api/cc/usage', requireAppKey, async (req, res) => {
+  const bridge = bridgeConfig();
+  if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+  const qs = new URLSearchParams();
+  if (req.query.brief === '1') qs.set('brief', '1');
+  for (const k of ['days', 'hours']) if (typeof req.query[k] === 'string' && /^\d{1,3}$/.test(req.query[k])) qs.set(k, req.query[k]);
+  try {
+    const r = await fetch(`${bridge.url}/usage?${qs}`, {
+      headers: { 'Authorization': `Bearer ${bridge.token}` },
+      signal: AbortSignal.timeout(15000)
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(502).json({ error: data.error || `bridge ${r.status}` });
+    res.json(data);
+  } catch (err) {
+    console.error('CC bridge usage error:', err.message);
+    res.status(502).json({ error: 'bridge unreachable' });
+  }
+});
+
 // SSE 透传：bridge 的字节原样转给浏览器，不做缓冲。
 app.get('/api/cc/events', requireAppKey, async (req, res) => {
   const bridge = bridgeConfig();
