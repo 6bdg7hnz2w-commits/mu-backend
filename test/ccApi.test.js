@@ -38,6 +38,9 @@ function makeFake() {
       const send = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
       if (url.startsWith('/v1/')) {
         f.relayCalls.push({ url, body, auth: req.headers.authorization });
+        if (JSON.stringify(body.messages).includes('记忆压缩助手')) {
+          return send(200, { choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: '压缩后的记忆' } }] });
+        }
         const next = f.relayQueue.shift() || { content: '嗯，我在。', reasoning_content: '她回来了，想一想怎么说。' };
         if (next.status) return send(next.status, { error: { message: next.message || 'boom' } });
         if (next.delay) return setTimeout(() => send(200, { id: 'x', object: 'chat.completion', choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: next.content } }] }), next.delay);
@@ -64,7 +67,7 @@ function makeFake() {
       }
       if (url === '/system') return send(200, { ok: true });
       if (url === '/typing') return send(200, { ok: true });
-      if (url === '/persona') return f.persona ? send(200, { text: f.persona }) : send(404, { error: 'no persona' });
+      if (url === '/persona') return f.persona === 'ERR' ? send(500, { error: 'busy' }) : f.persona ? send(200, { text: f.persona }) : send(404, { error: 'no persona' });
       if (url === '/file-types') return send(200, { max_bytes: 1024 * 1024, max_items: 9, types: [{ ext: 'txt', kind: 'text', mime: ['text/plain'] }] });
       if (url.startsWith('/uploads/')) {
         if (url.endsWith('.txt')) { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('文件里的字'); }
@@ -79,7 +82,7 @@ function makeFake() {
 async function waitFor(pred, ms = 5000) {
   const until = Date.now() + ms;
   while (Date.now() < until) {
-    const v = pred();
+    const v = await pred();
     if (v) return v;
     await new Promise((r) => setTimeout(r, 20));
   }
@@ -340,6 +343,29 @@ test('API 模式：刚切过来时 CC 上一轮晚到的话不算回了她', asy
   assert.equal(reply.body.reply_to, sent.id);
 });
 
+test('API 模式：重试较早那条时，后面同样没回上的（routed:api）一起回，回给最后一条', async () => {
+  fake.reset();
+  useApi();
+  fake.addMessage({ id: 'r1', role: 'user', text: '第一条', routed: 'api' });
+  fake.addMessage({ id: 'r2', role: 'user', text: '第二条', routed: 'api' });
+  assert.equal((await post('/api/cc/retry', { id: 'r1' })).status, 200);
+  const reply = await waitFor(() => lastTo('/reply'));
+  assert.equal(reply.body.reply_to, 'r2');
+  assert.match(fake.relayCalls[0].body.messages.at(-1).content, /第一条\n.*第二条$/s);
+});
+
+test('API 模式：更早没回上的不会被翻出来', async () => {
+  fake.reset();
+  useApi();
+  fake.addMessage({ id: 'o1', role: 'user', text: '昨天那条', routed: 'api' });
+  fake.addMessage({ id: 'o2', role: 'assistant', text: 'CC 回的', pid: 'cc' });
+  const sent = await (await post('/api/cc/send', { text: '今天' })).json();
+  const reply = await waitFor(() => lastTo('/reply'));
+  assert.equal(reply.body.reply_to, sent.id);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(countTo('/reply'), 1);
+});
+
 test('API 模式：这一轮的图片转 base64 给模型看', async () => {
   fake.reset();
   useApi();
@@ -442,4 +468,78 @@ test('进程内：bridge 没人设 → 退回 settings.system_prompt；带上记
   } finally {
     local.server.close();
   }
+});
+
+function localTurns(local, url, env = {}) {
+  return makeApiTurns({
+    bridgeConfig: () => ({ url, token: 't' }),
+    supabase: fakeSupabase({ settings: [{ system_prompt: '设置里的人设' }] }),
+    voiceRule: '', formatTime: () => '10-16 14:00', estimateTokens: (t) => t.length,
+    env: { RELAY_BASE_URL: `${url}/v1`, RELAY_API_KEY: 'k', API_TURN_DEBOUNCE_MS: '0', ...env },
+    log: { error() {} },
+  });
+}
+
+test('进程内：回着的时候她又连发两条，跨过这一轮结束也合成一轮', async () => {
+  const local = makeFake();
+  await new Promise((r) => local.server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${local.server.address().port}`;
+  try {
+    local.brain = { target: 'api', api_model: '[B]claude-opus-4-5', api_group: 'default' };
+    const turns = localTurns(local, url, { API_TURN_DEBOUNCE_MS: '300' });
+    local.relayQueue.push({ content: '第一轮', delay: 500 });
+    turns.enqueue(local.addMessage({ id: 'd1', role: 'user', text: '一' }).id);
+    await waitFor(() => local.relayCalls.length === 1);
+    await new Promise((r) => setTimeout(r, 350));
+    turns.enqueue(local.addMessage({ id: 'd2', role: 'user', text: '二' }).id); // 第一轮快结束时
+    await waitFor(() => local.seen.some((r) => r.url === '/reply'));
+    turns.enqueue(local.addMessage({ id: 'd3', role: 'user', text: '三' }).id); // 刚结束，还在 debounce 里
+    await waitFor(() => local.seen.filter((r) => r.url === '/reply').length === 2);
+    await new Promise((r) => setTimeout(r, 400));
+    const replies = local.seen.filter((r) => r.url === '/reply');
+    assert.equal(local.relayCalls.length, 2);
+    assert.equal(replies.length, 2);
+    assert.equal(replies[1].body.reply_to, 'd3');
+  } finally {
+    local.server.close();
+  }
+});
+
+test('进程内：bridge 的人设一时拿不到不缓存，下一轮好了就用上', async () => {
+  const local = makeFake();
+  await new Promise((r) => local.server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${local.server.address().port}`;
+  try {
+    local.brain = { target: 'api', api_model: '[B]claude-opus-4-5', api_group: 'default' };
+    const turns = localTurns(local, url);
+    local.persona = 'ERR';
+    turns.enqueue(local.addMessage({ id: 'q1', role: 'user', text: '一' }).id);
+    await waitFor(() => local.seen.some((r) => r.url === '/reply'));
+    assert.match(local.relayCalls[0].body.messages[0].content, /^设置里的人设/);
+    local.persona = '你是沐（bridge 给的人设）。';
+    turns.enqueue(local.addMessage({ id: 'q2', role: 'user', text: '二' }).id);
+    await waitFor(() => local.seen.filter((r) => r.url === '/reply').length === 2);
+    assert.match(local.relayCalls[1].body.messages[0].content, /^你是沐（bridge 给的人设）/);
+  } finally {
+    local.server.close();
+  }
+});
+
+// --- /api/chat 的压缩：交给 Claude，不用 DeepSeek ---
+test('压缩：Claude 会话用它自己的模型压（走中转站，不走 DeepSeek），回完她再压', async () => {
+  fake.reset();
+  const session = await (await post('/api/sessions', { name: '沐', model: 'opus' })).json();
+  const long = '今天的事'.repeat(220); // 约 1760 token 一条
+  for (let i = 0; i < 16; i++) {
+    const r = await post('/api/chat', { session_id: session.id, message: `${i} ${long}`, model: 'opus' });
+    assert.equal(r.status, 200);
+  }
+  const call = await waitFor(() => fake.relayCalls.find((c) => JSON.stringify(c.body.messages).includes('记忆压缩助手')));
+  assert.equal(call.body.model, '[C]claude-opus-4-6-thinking');
+  assert.ok(call.body.max_tokens >= 4096);
+  const memories = await waitFor(async () => {
+    const list = await (await get('/api/memories')).json();
+    return list.some((m) => m.summary === '压缩后的记忆') ? list : null;
+  }).catch(() => null);
+  assert.ok(memories, 'compressed memory saved');
 });

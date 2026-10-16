@@ -7,7 +7,7 @@ const multer = require('multer');
 const { makeRhythmStore } = require('./lib/rhythmStore');
 const { fetchFileTypes, checkFile } = require('./lib/ccFiles');
 const { findOption, publicCatalog, keyEnvName } = require('./lib/apiModels');
-const { makeApiTurns } = require('./lib/apiTurn');
+const { makeApiTurns, splitThinking } = require('./lib/apiTurn');
 const crypto = require('node:crypto');
 
 process.on('uncaughtException', (err) => {
@@ -316,9 +316,14 @@ async function classifyMood(text) {
   }
 }
 
-async function compressMemory(sessionId, messages, settings) {
-  const threshold = settings.compress_threshold || 12000;
-  const keepRounds = settings.compress_keep_rounds || 15;
+// 压缩交给 Claude 自己，不用 DeepSeek：Claude 会话用它自己那个模型压，DeepSeek 会话用中转站的 RELAY_DEFAULT_MODEL。
+// 思考变体先花 token 想，max_tokens 给足；Claude 比 DeepSeek 慢，所以 /api/chat 回完她再压，不耽误回复。
+// 压出来是空的、记忆没写进去，就不藏原消息，免得这段对话两头都没了
+const COMPRESS_TIMEOUT_MS = 120000;
+const compressing = new Set(); // 正在压的会话：上一次还没压完，下一条消息不再压同一段
+async function compressMemory(sessionId, messages, settings, claudeModel) {
+  const threshold = settings?.compress_threshold || 12000;
+  const keepRounds = settings?.compress_keep_rounds || 15;
 
   let totalTokens = 0;
   for (const m of messages) totalTokens += estimateTokens(m.content);
@@ -326,6 +331,7 @@ async function compressMemory(sessionId, messages, settings) {
 
   const keepCount = keepRounds * 2;
   if (messages.length <= keepCount) return;
+  if (compressing.has(sessionId)) return;
 
   const toCompress = messages.slice(0, messages.length - keepCount);
   const compressPrompt = '你是一个记忆压缩助手。请将对话压缩成简短的记忆摘要，保留关键信息、情感和重要细节，用第三人称描述。';
@@ -334,19 +340,29 @@ async function compressMemory(sessionId, messages, settings) {
     content: '请压缩以下对话：\n\n' + toCompress.map(m => m.role + ': ' + m.content).join('\n')
   }];
 
+  compressing.add(sessionId);
   try {
-    const result = await callModel('deepseek', compressPrompt, compressMessages, 1024);
-    await supabase.from('memories').insert({
-      summary: result.text,
+    const response = await relay.chat.completions.create({
+      model: MODEL_MAP[claudeModel] || RELAY_DEFAULT_MODEL,
+      max_tokens: 4096,
+      messages: [{ role: 'system', content: compressPrompt }, ...compressMessages]
+    }, { timeout: COMPRESS_TIMEOUT_MS });
+    const summary = splitThinking(response.choices?.[0]?.message?.content, '').text;
+    if (!summary) throw new Error('compression returned no text');
+    const { error: insertError } = await supabase.from('memories').insert({
+      summary,
       session_id: 'global',
       conversation_id: String(sessionId),
       timestamp: new Date().toISOString()
     });
+    if (insertError) throw new Error(insertError.message);
     const ids = toCompress.map(m => m.id);
     await supabase.from('messages').update({ visible: false }).in('id', ids);
     console.log('Compressed ' + toCompress.length + ' messages');
   } catch (err) {
     console.error('Compression error:', err.message);
+  } finally {
+    compressing.delete(sessionId);
   }
 }
 
@@ -412,9 +428,11 @@ app.post('/api/chat', requireAppKey, async (req, res) => {
     }).select().single();
 
     await supabase.from('sessions').update({ updated_at: new Date().toISOString() }).eq('id', session_id);
-    await compressMemory(session_id, history, settings);
 
     res.json({ reply: result.text, thinking: result.thinking, model: useModel, voice: isVoice });
+
+    compressMemory(session_id, history, settings, isClaudeModel ? useModel : null)
+      .catch(err => console.error('Compression error:', err.message));
 
     if (inserted?.id) {
       classifyMood(result.text).then(async (mood) => {

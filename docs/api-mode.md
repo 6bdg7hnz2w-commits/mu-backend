@@ -93,11 +93,12 @@ API 模式下后端在回完前端之后自己排一轮 API，前端照常等 SS
    默认 `target: "cc"`。
 
 2. **`POST /send`**：`target=api` 时照常落库（id、seq、client_id 去重、图片文件校验都不变），
-   **不交给 CC**，记一笔"这条是 API 接的"，SSE 推 `{type:'typing', on:true, since}`，
+   **不交给 CC**，这条消息记上 `routed:"api"`，SSE 推 `{type:'typing', on:true, since}`，
    响应在原有字段外加 `brain:"api"`。`target=cc` 时行为不变，响应加 `brain:"cc"`。
 
-3. **`POST /retry {id}`**：`target=api` 时不叫 CC：找不到 404，她这条之后已经有沐的回复了 409，
-   否则 SSE 推 typing on，返回 `{ ok:true, brain:"api" }`。
+3. **`POST /retry {id}`**：`target=api` 时不叫 CC：找不到 404，否则 SSE 推 typing on，返回 `{ ok:true, brain:"api" }`。
+   这时**不要**按"她这条后面有没有沐的话"回 409：API 回的那条 seq 可能排在她后来发的消息后面，
+   按位置判断会把该回的拦掉。要不要回由后端判断（它按 `reply_to` 认）。
 
 4. **`POST /reply`**（新，后端用）：
    `{ text, thinking?, model, group?, reply_to, turn_id }` → 存成沐的一条消息：
@@ -112,7 +113,8 @@ API 模式下后端在回完前端之后自己排一轮 API，前端照常等 SS
 6. **`POST /typing`**（新，后端用）：`{ on: bool }` → SSE 推 `{type:'typing', on, since?}`。
    API 模式下 typing 的超时规则和 CC 一样。
 
-7. **`/history`、SSE**：API 回的那条带上第 4 条里的字段（`via`、`model`、`group`、`thinking`、`reply_to`）。
+7. **`/history`、SSE**：API 回的那条带上第 4 条里的字段（`via`、`model`、`group`、`thinking`、`reply_to`）；
+   她的消息里 API 接的那些带上 `routed:"api"`。
 
 8. **`GET /persona`**（新）：`{ "text": "..." }`。人设抽成一个文件（例如 `/opt/mu-bridge/persona.md`），
    `~/.claude/CLAUDE.md` 里用一行 `@/opt/mu-bridge/persona.md` 引入，CC 和 API 读的是同一份。
@@ -137,9 +139,10 @@ API 模式下后端在回完前端之后自己排一轮 API，前端照常等 SS
 
 ## 三、后端怎么跑一轮 API（lib/apiTurn.js）
 
-- **排队**：`/send`、`/retry` 返回 `brain:"api"` 就把她那条记进待回集合。等 2.5 秒（她连发几条只回一轮），
-  同一时间只跑一轮；跑的时候又来了新的，跑完再补一轮。她那条后面已经有 API 的回复了就不再回（重发去重）；
-  CC 的话不算（这些消息 CC 没见过，刚切过来时 CC 上一轮晚到的话不是在回她这条）。
+- **排队**：`/send`、`/retry` 返回 `brain:"api"` 就把她那条记进待回集合。从她最后一条算起等 2.5 秒
+  （她连发几条只回一轮），同一时间只跑一轮；跑的时候又来了新的，跑完照样等满 2.5 秒再补一轮。
+  她那条后面已经有 API 的回复了就不再回（重发去重）；CC 的话不算（这些消息 CC 没见过，
+  刚切过来时 CC 上一轮晚到的话不是在回她这条）。重试较早那条时，它后面带 `routed:"api"` 还没回上的一起回。
 - **上文**：`GET /history?limit=60`，只要她和沐的消息，按 seq 排，API 回的那条挪到它 `reply_to` 那条后面；
   从后往前按 token 估算截到预算内；同一边连着的几条合成一条；她的消息前面带 `[MM-DD HH:mm]`。
   这一轮要回的消息里的图片从 bridge 取回来转 base64 给模型看（最多 4 张），小的文本文件内联，
