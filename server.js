@@ -6,6 +6,8 @@ const OpenAI = require('openai');
 const multer = require('multer');
 const { makeRhythmStore } = require('./lib/rhythmStore');
 const { fetchFileTypes, checkFile } = require('./lib/ccFiles');
+const { findOption, publicCatalog, keyEnvName } = require('./lib/apiModels');
+const { makeApiTurns } = require('./lib/apiTurn');
 const crypto = require('node:crypto');
 
 process.on('uncaughtException', (err) => {
@@ -1426,6 +1428,9 @@ function bridgeConfig() {
   return url && token ? { url, token } : null;
 }
 
+// 切到 API 时替沐回消息的那一套（lib/apiTurn.js）；/send、/retry 看到 bridge 回 brain:"api" 就交给它
+const apiTurns = makeApiTurns({ bridgeConfig, supabase, voiceRule: VOICE_RULE, formatTime: formatChatTimestamp, estimateTokens });
+
 // 图片 + 文件一次最多几个看白名单里的 max_items；白名单拉不到时按 9 算（bridge 那边还会再卡一次）
 const CC_MAX_ITEMS_FALLBACK = 9;
 // 前端给每条消息的 client_id、消息 id：后端只卡类型和长度，去重、找消息都是 bridge 的事
@@ -1466,7 +1471,9 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
       return res.status(r.status === 400 ? 400 : 502).json({ error: r.status === 400 && data.error ? data.error : `bridge ${r.status}` });
     }
     const data = await r.json().catch(() => ({}));
-    res.json({ ok: true, id: data.id, time: data.time, ...(Number.isSafeInteger(data.seq) ? { seq: data.seq } : {}) });
+    const brain = data.brain === 'api' || data.brain === 'cc' ? data.brain : undefined;
+    res.json({ ok: true, id: data.id, time: data.time, ...(Number.isSafeInteger(data.seq) ? { seq: data.seq } : {}), ...(brain ? { brain } : {}) });
+    if (brain === 'api') apiTurns.enqueue(data.id);
   } catch (err) {
     console.error('CC bridge send error:', err.message);
     res.status(502).json({ error: 'bridge unreachable' });
@@ -1474,7 +1481,8 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
 });
 
 // 带 BRIDGE_TOKEN 把 JSON POST 给 bridge；bridge 的 400/404/409（参数不对、找不到、不用重发）原样回给前端，别的算 502
-async function forwardCcPost(res, path, body) {
+// onOk：成功时拿 bridge 的响应再做点事（回完前端之后）
+async function forwardCcPost(res, path, body, onOk) {
   const bridge = bridgeConfig();
   if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
   try {
@@ -1490,9 +1498,10 @@ async function forwardCcPost(res, path, body) {
       return res.status([400, 404, 409].includes(r.status) ? r.status : 502).json({ error: data.error || `bridge ${r.status}` });
     }
     res.json(data);
+    onOk?.(data);
   } catch (err) {
     console.error(`CC bridge ${path} error:`, err.message);
-    res.status(502).json({ error: 'bridge unreachable' });
+    if (!res.headersSent) res.status(502).json({ error: 'bridge unreachable' });
   }
 }
 
@@ -1509,7 +1518,73 @@ app.post('/api/cc/edit', requireAppKey, (req, res) => {
 app.post('/api/cc/retry', requireAppKey, (req, res) => {
   const id = req.body?.id;
   if (!isCcId(id)) return res.status(400).json({ error: 'id required' });
-  return forwardCcPost(res, '/retry', { id });
+  // API 模式下 bridge 不叫 CC，回 brain:"api"，由这边重跑一轮
+  return forwardCcPost(res, '/retry', { id }, (data) => { if (data?.brain === 'api') apiTurns.enqueue(id); });
+});
+
+// === 回复方式：CC / API（docs/api-mode.md）===
+
+// 能选的模型和分组；ready 表示这个分组的 key 在环境变量里配了
+app.get('/api/cc/api-models', requireAppKey, (req, res) => res.json(publicCatalog()));
+
+// bridge 的 /brain 加上选中模型在目录里的样子
+function brainView(brain) {
+  if (!brain) return { supported: false, target: 'cc', model: null, group: null, option: null, family: null };
+  const model = typeof brain.api_model === 'string' ? brain.api_model : null;
+  const group = typeof brain.api_group === 'string' ? brain.api_group : null;
+  const found = model && group ? findOption(model, group) : null;
+  return { supported: true, target: brain.target === 'api' ? 'api' : 'cc', model, group, option: found?.option || null, family: found?.family || null };
+}
+
+app.get('/api/cc/brain', requireAppKey, async (req, res) => {
+  if (!bridgeConfig()) return res.status(500).json({ error: 'bridge not configured' });
+  try {
+    res.json(brainView(await apiTurns.getBrain()));
+  } catch (err) {
+    console.error('CC bridge brain error:', err.message);
+    res.status(502).json({ error: 'bridge unreachable' });
+  }
+});
+
+// { target:'cc' } / { target:'api' }（用上次选的，没选过用默认）/ { target:'api', model, group }（选模型）
+app.post('/api/cc/brain', requireAppKey, async (req, res) => {
+  if (!bridgeConfig()) return res.status(500).json({ error: 'bridge not configured' });
+  const { target, model, group } = req.body || {};
+  if (target !== 'cc' && target !== 'api') return res.status(400).json({ error: 'target must be cc or api' });
+  if ((model !== undefined || group !== undefined) && !(typeof model === 'string' && typeof group === 'string')) {
+    return res.status(400).json({ error: 'model and group must be given together' });
+  }
+  try {
+    const body = { target };
+    if (target === 'api' || model !== undefined) {
+      let found;
+      if (model !== undefined) {
+        found = findOption(model, group);
+        if (!found) return res.status(400).json({ error: `没有这个模型：${group} / ${model}` });
+      } else {
+        const current = await apiTurns.getBrain();
+        if (!current) return res.status(501).json({ error: 'bridge 还没更新，不能切换' });
+        found = apiTurns.resolveOption(current);
+      }
+      if (!found.option.ready) return res.status(400).json({ error: `分组 ${found.option.group} 的 key 没配（${found.option.group === 'default' ? 'RELAY_API_KEY' : keyEnvName(found.option.group)}）` });
+      Object.assign(body, { api_model: found.option.model, api_group: found.option.group });
+    }
+    const r = await apiTurns.bridgeFetch('/brain', { method: 'POST', body });
+    if (r.status === 404) return res.status(501).json({ error: 'bridge 还没更新，不能切换' });
+    if (!r.ok) return res.status(r.status === 400 ? 400 : 502).json({ error: r.data?.error || `bridge ${r.status}` });
+    res.json(brainView(r.data));
+  } catch (err) {
+    console.error('CC bridge brain error:', err.message);
+    res.status(502).json({ error: 'bridge unreachable' });
+  }
+});
+
+// 设置页"测试一下"：真调一次，看这个模型 + 分组通不通
+app.post('/api/cc/api-test', requireAppKey, async (req, res) => {
+  const { model, group } = req.body || {};
+  const found = typeof model === 'string' && typeof group === 'string' ? findOption(model, group) : null;
+  if (!found) return res.status(400).json({ error: 'unknown model / group' });
+  res.json(await apiTurns.testModel(found.option));
 });
 
 // 图片和文件上传：multipart，字段名 image（图片，和以前一样）或 file（文件，白名单见 lib/ccFiles.js）
