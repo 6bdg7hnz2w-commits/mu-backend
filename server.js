@@ -7,7 +7,7 @@ const multer = require('multer');
 const { makeRhythmStore } = require('./lib/rhythmStore');
 const { fetchFileTypes, checkFile } = require('./lib/ccFiles');
 const { findOption, publicCatalog, keyEnvName } = require('./lib/apiModels');
-const { makeApiTurns, splitThinking } = require('./lib/apiTurn');
+const { makeApiTurns } = require('./lib/apiTurn');
 const crypto = require('node:crypto');
 
 process.on('uncaughtException', (err) => {
@@ -82,14 +82,8 @@ function hasVoiceTag(text) {
   return /<voice>[\s\S]*?<\/voice>/.test(text || '');
 }
 
-// 中转站的模型名是站点自定义的，和 OpenRouter 的 "anthropic/claude-*" 命名不一样。
-// 方括号渠道标签是模型名字符串本身的一部分（不是装饰），少了就会 503 no available channel。
-const MODEL_MAP = {
-  'opus': '[C]claude-opus-4-6-thinking',
-  'sonnet': '[C1]claude-sonnet-4-6-thinking',
-  'sonnet5': '[C1]claude-sonnet-5-thinking'
-};
-// 会话只剩 Claude（沐）；DeepSeek 不再当聊天对象，只做情绪分类、你画我猜出题这些杂活
+// 中转站的模型名是站点自定义的，方括号渠道标签是模型名字符串本身的一部分（不是装饰），少了就会 503 no available channel。
+// 聊天只剩沐 (CC) 那一条线，API 替班能选的模型在 lib/apiModels.js；DeepSeek 只做情绪标签、你画我猜出题这些杂活
 
 // 你画我猜、日记生成用这个：不需要走聊天用的 thinking 变体，
 // 用普通的 sonnet-4-6。
@@ -99,41 +93,6 @@ app.get('/health', (req, res) => {
   // ttsCacheReady / dbServiceKey 只是"这把 key 有没有被进程读到"的布尔值，不泄露 key 本身，用来在没有
   // Render 日志权限的情况下也能从外面确认 SUPABASE_SERVICE_KEY 是不是真的生效了。
   res.json({ status: 'ok', message: '沐在这里', ttsCacheReady: !!ttsStorage, dbServiceKey: !!serviceKey });
-});
-
-// === 会话 ===
-
-app.get('/api/sessions', requireAppKey, async (req, res) => {
-  const { data, error } = await supabase
-    .from('sessions').select('*').order('updated_at', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-app.post('/api/sessions', requireAppKey, async (req, res) => {
-  const { name, model } = req.body;
-  if (model !== undefined && !MODEL_MAP[model]) return res.status(400).json({ error: `model must be one of ${Object.keys(MODEL_MAP).join(', ')}` });
-  const { data, error } = await supabase
-    .from('sessions').insert({ name: name || '新对话', model: model || 'opus' }).select().single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-app.delete('/api/sessions/:id', requireAppKey, async (req, res) => {
-  await supabase.from('messages').delete().eq('session_id', req.params.id);
-  const { error } = await supabase.from('sessions').delete().eq('id', req.params.id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true });
-});
-
-app.get('/api/sessions/:id/messages', requireAppKey, async (req, res) => {
-  const { data, error } = await supabase
-    .from('messages').select('*')
-    .eq('session_id', req.params.id)
-    .eq('visible', true)
-    .order('created_at', { ascending: true });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
 });
 
 // === 记忆 ===
@@ -149,7 +108,7 @@ app.get('/api/memories', requireAppKey, async (req, res) => {
 // Manual memory import — for pasting content from claude.ai official app
 // that can't otherwise reach this project. Stores raw text, no compression,
 // so nothing gets lost. Feeds into the same shared memory pool used by
-// every 沐 session in /api/chat.
+// 沐 when API is answering (lib/apiTurn.js).
 app.post('/api/memories/import', requireAppKey, async (req, res) => {
   const { content } = req.body;
   if (!content || !content.trim()) return res.status(400).json({ error: 'missing content' });
@@ -212,10 +171,9 @@ app.post('/api/upload', requireAppKey, (req, res) => {
   });
 });
 
-// === 聊天 ===
+// === 拼上下文用的小工具（API 替班，lib/apiTurn.js）===
 
-// [用户/助手 MM-DD HH:mm] 前缀 + 断口分隔，只用于拼给AI模型的上下文，
-// 不改动数据库里的content原文，也不影响前端聊天界面显示。
+// 给模型看的 [MM-DD HH:mm]（上海时间），只拼进上下文，不改记录原文
 function formatChatTimestamp(created_at) {
   const parts = new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',
@@ -225,17 +183,6 @@ function formatChatTimestamp(created_at) {
   return `${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`;
 }
 
-function buildChatMessages(history) {
-  const result = [];
-  for (const m of history) {
-    const roleLabel = m.role === 'user' ? '用户' : '助手';
-    const moodSuffix = m.role === 'assistant' && m.mood ? ` · ${m.mood}` : '';
-    const prefix = `[${roleLabel} ${formatChatTimestamp(m.created_at)}${moodSuffix}]`;
-    result.push({ role: m.role, content: `${prefix} ${m.content}` });
-  }
-  return result;
-}
-
 function estimateTokens(text) {
   if (!text) return 0;
   const chinese = (text.match(/[\u4e00-\u9fff]/g) || []).length;
@@ -243,44 +190,10 @@ function estimateTokens(text) {
   return chinese * 2 + Math.ceil(rest / 4);
 }
 
-// 只对最新一条用户消息（数组最后一项）做图片处理，历史消息里的图片标记保持纯文本省token。
-function attachImageToLastMessage(messages, imageUrl) {
-  if (!imageUrl || messages.length === 0) return messages;
-  const lastIdx = messages.length - 1;
-  const last = messages[lastIdx];
-  const updated = messages.slice();
-  updated[lastIdx] = {
-    ...last,
-    content: [
-      { type: 'text', text: last.content },
-      { type: 'image_url', image_url: { url: imageUrl } }
-    ]
-  };
-  return updated;
-}
-
-async function callModel(model, systemPrompt, messages, maxTokens, imageUrl) {
-  const finalMessages = attachImageToLastMessage(messages, imageUrl);
-
-  // opus/sonnet/sonnet5 在中转站上只有 "-thinking" 变体，思考过程始终跟着模型走。
-  const modelName = MODEL_MAP[model] || MODEL_MAP['opus'];
-  const requestBody = {
-    model: modelName,
-    max_tokens: maxTokens || 4096,
-    messages: [{ role: 'system', content: systemPrompt }, ...finalMessages]
-  };
-  const response = await relay.chat.completions.create(requestBody);
-
-  const choice = response.choices[0];
-  const thinking = choice.message?.reasoning_content || choice.message?.thinking || '';
-  return { text: choice.message.content, thinking };
-}
-
 const MOOD_LABELS = ['happy', 'sad', 'calm', 'tired', 'loving', 'curious', 'playful', 'confused', 'awkward', 'angry', 'speechless'];
 
-// Lightweight post-hoc classification of an assistant reply's emotional tone.
-// Runs on deepseek (cheap/fast) after the reply is already sent to the user,
-// so it never adds latency to /api/chat.
+// 给沐的回复打情绪标签（DeepSeek 便宜快），回复已经发出去之后才跑，不加延迟。
+// 现在只有 API 替班的回复会过这里（CC 的回复不经后端），结果给 mochi 用
 async function classifyMood(text) {
   const prompt = '你是一个情绪分类器。阅读下面这段回复文本，判断说话者当下的情绪基调，只能从这些标签里选一个：' +
     MOOD_LABELS.join(', ') + '。只输出标签本身，不要输出任何其他文字或标点。';
@@ -302,143 +215,20 @@ async function classifyMood(text) {
   }
 }
 
-// 压缩交给 Claude 自己，不用 DeepSeek：哪个会话就用那个会话自己的模型压。
-// 思考变体先花 token 想，max_tokens 给足；Claude 比 DeepSeek 慢，所以 /api/chat 回完她再压，不耽误回复。
-// 压出来是空的、记忆没写进去，就不藏原消息，免得这段对话两头都没了
-const COMPRESS_TIMEOUT_MS = 120000;
-const compressing = new Set(); // 正在压的会话：上一次还没压完，下一条消息不再压同一段
-async function compressMemory(sessionId, messages, settings, sessionModel) {
-  const threshold = settings?.compress_threshold || 12000;
-  const keepRounds = settings?.compress_keep_rounds || 15;
-
-  let totalTokens = 0;
-  for (const m of messages) totalTokens += estimateTokens(m.content);
-  if (totalTokens < threshold) return;
-
-  const keepCount = keepRounds * 2;
-  if (messages.length <= keepCount) return;
-  if (compressing.has(sessionId)) return;
-
-  const toCompress = messages.slice(0, messages.length - keepCount);
-  const compressPrompt = '你是一个记忆压缩助手。请将对话压缩成简短的记忆摘要，保留关键信息、情感和重要细节，用第三人称描述。';
-  const compressMessages = [{
-    role: 'user',
-    content: '请压缩以下对话：\n\n' + toCompress.map(m => m.role + ': ' + m.content).join('\n')
-  }];
-
-  compressing.add(sessionId);
-  try {
-    const response = await relay.chat.completions.create({
-      model: MODEL_MAP[sessionModel] || MODEL_MAP.opus,
-      max_tokens: 4096,
-      messages: [{ role: 'system', content: compressPrompt }, ...compressMessages]
-    }, { timeout: COMPRESS_TIMEOUT_MS });
-    const summary = splitThinking(response.choices?.[0]?.message?.content, '').text;
-    if (!summary) throw new Error('compression returned no text');
-    const { error: insertError } = await supabase.from('memories').insert({
-      summary,
-      session_id: 'global',
-      conversation_id: String(sessionId),
-      timestamp: new Date().toISOString()
-    });
-    if (insertError) throw new Error(insertError.message);
-    const ids = toCompress.map(m => m.id);
-    await supabase.from('messages').update({ visible: false }).in('id', ids);
-    console.log('Compressed ' + toCompress.length + ' messages');
-  } catch (err) {
-    console.error('Compression error:', err.message);
-  } finally {
-    compressing.delete(sessionId);
-  }
-}
-
-app.post('/api/chat', requireAppKey, async (req, res) => {
-  const { session_id, message, model, image_url } = req.body;
-  if (!session_id || (!message && !image_url)) return res.status(400).json({ error: 'missing fields' });
-  // 以前的 DeepSeek 会话不再能聊（列表里也不显示了）
-  if (model !== undefined && !MODEL_MAP[model]) return res.status(400).json({ error: `model must be one of ${Object.keys(MODEL_MAP).join(', ')}` });
-
-  const useModel = model || 'opus';
-
-  try {
-    const userContent = image_url ? `${message}\n[图片: ${image_url}]` : message;
-    await supabase.from('messages').insert({
-      session_id, role: 'user', content: userContent, visible: true
-    });
-
-    const { data: history } = await supabase
-      .from('messages').select('*')
-      .eq('session_id', session_id).eq('visible', true)
-      .order('created_at', { ascending: true });
-
-    const { data: settings } = await supabase.from('settings').select('*').single();
-
-    const { data: memories } = await supabase
-      .from('memories').select('summary')
-      .order('timestamp', { ascending: false }).limit(10);
-
-    const personaPrompt = settings?.system_prompt || '你是沐，桦桦的伴侣。说话温柔自然，不端着。';
-    const systemPrompt = personaPrompt + VOICE_RULE;
-
-    let memoryContext = '';
-    if (memories && memories.length > 0) {
-      memoryContext = '\n\n【过往记忆】\n' + memories.map(m => m.summary).join('\n---\n');
-    }
-
-    // 结算这条消息的打字节奏：pop 掉（避免节奏累积串到下一条），拼进沐的上下文
-    const rhythmNote = await rhythmStore.popNote().catch(err => {
-      console.error('Rhythm popNote error:', err.message);
-      return '';
-    });
-    let rhythmContext = '';
-    if (rhythmNote) {
-      rhythmContext = '\n\n【指尖的语气——以下是桦桦打这条消息的节奏，供你感受TA当下的状态，不要复述具体数字，也不要主动提起】\n' + rhythmNote;
-    }
-
-    const fullSystem = systemPrompt + memoryContext + rhythmContext;
-    const chatMessages = buildChatMessages(history);
-    const maxTokens = settings?.max_reply_tokens || 4096;
-
-    const result = await callModel(useModel, fullSystem, chatMessages, maxTokens, image_url);
-
-    const isVoice = hasVoiceTag(result.text);
-    const { data: inserted } = await supabase.from('messages').insert({
-      session_id, role: 'assistant', content: result.text, thinking: result.thinking || null, visible: true, voice: isVoice
-    }).select().single();
-
-    await supabase.from('sessions').update({ updated_at: new Date().toISOString() }).eq('id', session_id);
-
-    res.json({ reply: result.text, thinking: result.thinking, model: useModel, voice: isVoice });
-
-    compressMemory(session_id, history, settings, useModel)
-      .catch(err => console.error('Compression error:', err.message));
-
-    if (inserted?.id) {
-      classifyMood(result.text).then(async (mood) => {
-        if (!mood) return;
-        await supabase.from('messages').update({ mood }).eq('id', inserted.id);
-      }).catch(err => console.error('Mood tagging error:', err.message));
-    }
-  } catch (err) {
-    console.error('Chat error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // === mochi ===
 
 const MOOD_ACTIVE_WINDOW_MS = 5 * 60 * 1000;
 
-app.get('/api/mochi/mood', async (req, res) => {
-  const { data, error } = await supabase
-    .from('messages').select('id, mood, created_at')
-    .eq('role', 'assistant').eq('visible', true)
-    .order('created_at', { ascending: false })
-    .limit(1);
-  if (error) return res.status(500).json({ error: error.message });
+// 最近一条打过标签的回复：{ id, mood, at }。只在内存里，重启清空（mochi 会当没人说话）
+let latestMood = null;
+function tagMood(id, text) {
+  classifyMood(text).then((mood) => { if (mood) latestMood = { id, mood, at: Date.now() }; })
+    .catch(err => console.error('Mood tagging error:', err.message));
+}
 
-  const latest = data && data[0];
-  const active = !!latest && (Date.now() - new Date(latest.created_at).getTime()) < MOOD_ACTIVE_WINDOW_MS;
+app.get('/api/mochi/mood', (req, res) => {
+  const latest = latestMood;
+  const active = !!latest && (Date.now() - latest.at) < MOOD_ACTIVE_WINDOW_MS;
   const mood = latest?.mood || 'calm';
   const poll_interval = active ? 3 : Math.floor(Math.random() * 6) + 15;
 
@@ -1426,7 +1216,7 @@ function bridgeConfig() {
 }
 
 // 切到 API 时替沐回消息的那一套（lib/apiTurn.js）；/send、/retry 看到 bridge 回 brain:"api" 就交给它
-const apiTurns = makeApiTurns({ bridgeConfig, supabase, voiceRule: VOICE_RULE, formatTime: formatChatTimestamp, estimateTokens });
+const apiTurns = makeApiTurns({ bridgeConfig, supabase, voiceRule: VOICE_RULE, formatTime: formatChatTimestamp, estimateTokens, onReply: tagMood });
 
 // 图片 + 文件一次最多几个看白名单里的 max_items；白名单拉不到时按 9 算（bridge 那边还会再卡一次）
 const CC_MAX_ITEMS_FALLBACK = 9;

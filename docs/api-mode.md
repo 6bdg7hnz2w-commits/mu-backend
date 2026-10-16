@@ -152,6 +152,12 @@ API 模式下后端在回完前端之后自己排一轮 API，前端照常等 SS
 - **调模型**：选中的模型名原样发给中转站（`RELAY_BASE_URL`），key 按分组选（见下）。超时 180 秒。
   思考过程取 `reasoning_content` / `thinking`，或者正文开头的 `<think>…</think>` / `<thinking>…</thinking>`。
 - **回写**：成功 → `POST /reply`；失败或正文为空 → `POST /system reply_failed`（她点"再叫他一下"会重跑）。
+- **压缩**：每次 API 回完，看 bridge 里还没压过的记录（最多看最近 200 条）：超过 `settings.compress_threshold`
+  （默认 12000 token）而且多于 `compress_keep_rounds × 2`（默认 30）条，就把较早的那段压成一条记忆
+  （`memories`，`session_id 'cc'`，`metadata.upto_time` 记到哪条为止），之后拼上文从那以后开始，压掉的那段靠记忆。
+  bridge 里的原记录一条不动。压缩模型按顺序试，失败就换下一个：
+  `[A]claude-hybrid` → `hybrid2` → `hybrid3` → `[K]` Opus 4.6 / 4.7 / 4.8 → `[B]` Opus 4.6 / 4.7 / 4.8 → `[P]` Opus 4.8 / 5.5（`lib/apiModels.js` 的 `COMPRESS_CHAIN`）。
+- **mochi**：API 回的话用 DeepSeek 打情绪标签，`/api/mochi/mood` 读最近一条（只在内存里）。CC 的回复不经后端，不打标签。
 
 ## 四、中转站的 key（Render 环境变量）
 

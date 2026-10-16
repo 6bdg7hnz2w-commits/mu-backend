@@ -20,10 +20,10 @@ const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR
 function makeFake() {
   const f = {
     seen: [], history: [], seq: 0, brain: { target: 'cc', api_model: null, api_group: null },
-    hasBrain: true, persona: '你是沐（bridge 给的人设）。', relayQueue: [], relayCalls: [],
+    hasBrain: true, persona: '你是沐（bridge 给的人设）。', relayQueue: [], relayCalls: [], failModels: new Set(),
   };
   f.reset = () => {
-    f.seen.length = 0; f.history.length = 0; f.relayQueue.length = 0; f.relayCalls.length = 0;
+    f.seen.length = 0; f.history.length = 0; f.relayQueue.length = 0; f.relayCalls.length = 0; f.failModels.clear();
     f.brain = { target: 'cc', api_model: null, api_group: null }; f.hasBrain = true;
   };
   f.addMessage = (m) => { const msg = { time: new Date().toISOString(), seq: ++f.seq, ...m }; f.history.push(msg); return msg; };
@@ -38,6 +38,7 @@ function makeFake() {
       const send = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
       if (url.startsWith('/v1/')) {
         f.relayCalls.push({ url, body, auth: req.headers.authorization });
+        if (f.failModels.has(body.model)) return send(503, { error: { message: `no available channel for ${body.model}` } });
         if (JSON.stringify(body.messages).includes('记忆压缩助手')) {
           return send(200, { choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: '压缩后的记忆' } }] });
         }
@@ -525,26 +526,36 @@ test('进程内：bridge 的人设一时拿不到不缓存，下一轮好了就�
   }
 });
 
-// --- /api/chat 的压缩：交给 Claude，不用 DeepSeek ---
-test('压缩：Claude 会话用它自己的模型压（走中转站，不走 DeepSeek），回完她再压', async () => {
-  fake.reset();
-  const session = await (await post('/api/sessions', { name: '沐', model: 'opus' })).json();
-  const long = '今天的事'.repeat(220); // 约 1760 token 一条
-  for (let i = 0; i < 16; i++) {
-    const r = await post('/api/chat', { session_id: session.id, message: `${i} ${long}`, model: 'opus' });
-    assert.equal(r.status, 200);
-  }
-  const call = await waitFor(() => fake.relayCalls.find((c) => JSON.stringify(c.body.messages).includes('记忆压缩助手')));
-  assert.equal(call.body.model, '[C]claude-opus-4-6-thinking');
-  assert.ok(call.body.max_tokens >= 4096);
-  const memories = await waitFor(async () => {
-    const list = await (await get('/api/memories')).json();
-    return list.some((m) => m.summary === '压缩后的记忆') ? list : null;
-  }).catch(() => null);
-  assert.ok(memories, 'compressed memory saved');
-});
 
-test('DeepSeek 不再当聊天对象：建会话、聊天传 deepseek → 400', async () => {
-  assert.equal((await post('/api/sessions', { name: 'x', model: 'deepseek' })).status, 400);
-  assert.equal((await post('/api/chat', { session_id: 1, message: 'hi', model: 'deepseek-pro' })).status, 400);
+// --- API 替班的压缩：A 组 hybrid 1→3，再 K、B、P，失败就换下一个 ---
+test('压缩：攒够了就把较早的一段压成记忆，前两个模型挂了用 hybrid3；之后上文从压缩那以后开始', async () => {
+  fake.reset();
+  useApi();
+  fake.failModels.add('[A]claude-hybrid');
+  fake.failModels.add('[A]claude-hybrid2');
+  const long = '今天的事'.repeat(220); // 约 1760 token 一条
+  const t0 = Date.now() - 3600e3;
+  for (let i = 0; i < 40; i++) {
+    fake.addMessage({ id: `c${i}`, role: i % 2 ? 'assistant' : 'user', text: `${i} ${long}`, time: new Date(t0 + i * 1000).toISOString(), ...(i % 2 ? {} : { routed: 'api' }) });
+  }
+  fake.addMessage({ id: 'c-last-a', role: 'assistant', text: '好', via: 'api', reply_to: 'c38', time: new Date(t0 + 40000).toISOString() });
+  await post('/api/cc/send', { text: '在吗' });
+  await waitFor(() => lastTo('/reply'));
+  const compressCalls = await waitFor(() => {
+    const calls = fake.relayCalls.filter((c) => JSON.stringify(c.body.messages).includes('记忆压缩助手'));
+    return calls.length === 3 ? calls : null;
+  });
+  assert.deepEqual(compressCalls.map((c) => c.body.model), ['[A]claude-hybrid', '[A]claude-hybrid2', '[A]claude-hybrid3']);
+  const mem = await waitFor(async () => (await (await get('/api/memories')).json()).find((m) => m.session_id === 'cc'));
+  assert.equal(mem.summary, '压缩后的记忆');
+  assert.equal(mem.metadata.model, '[A]claude-hybrid3');
+  assert.equal(mem.metadata.count, 43 - 30); // 40 条 + 那条 API 回复 + 在吗 + 回她的，留最近 30 条不压
+
+  // 下一轮：已经压掉的那段不再原文给模型，记忆在 system 里
+  const before = fake.relayCalls.length;
+  await post('/api/cc/send', { text: '还在吗' });
+  await waitFor(() => fake.seen.filter((r) => r.url === '/reply').length === 2);
+  const turn = fake.relayCalls.slice(before).find((c) => !JSON.stringify(c.body.messages).includes('记忆压缩助手'));
+  assert.match(turn.body.messages[0].content, /【过往记忆】\n压缩后的记忆/);
+  assert.doesNotMatch(JSON.stringify(turn.body.messages.slice(1)), /"\[[^\]]*\] 0 今天的事/);
 });
