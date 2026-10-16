@@ -87,10 +87,9 @@ function hasVoiceTag(text) {
 const MODEL_MAP = {
   'opus': '[C]claude-opus-4-6-thinking',
   'sonnet': '[C1]claude-sonnet-4-6-thinking',
-  'sonnet5': '[C1]claude-sonnet-5-thinking',
-  'deepseek': 'deepseek-v4-flash',
-  'deepseek-pro': 'deepseek-v4-pro'
+  'sonnet5': '[C1]claude-sonnet-5-thinking'
 };
+// 会话只剩 Claude（沐）；DeepSeek 不再当聊天对象，只做情绪分类、你画我猜出题这些杂活
 
 // 你画我猜、日记生成用这个：不需要走聊天用的 thinking 变体，
 // 用普通的 sonnet-4-6。
@@ -113,6 +112,7 @@ app.get('/api/sessions', requireAppKey, async (req, res) => {
 
 app.post('/api/sessions', requireAppKey, async (req, res) => {
   const { name, model } = req.body;
+  if (model !== undefined && !MODEL_MAP[model]) return res.status(400).json({ error: `model must be one of ${Object.keys(MODEL_MAP).join(', ')}` });
   const { data, error } = await supabase
     .from('sessions').insert({ name: name || '新对话', model: model || 'opus' }).select().single();
   if (error) return res.status(500).json({ error: error.message });
@@ -149,7 +149,7 @@ app.get('/api/memories', requireAppKey, async (req, res) => {
 // Manual memory import — for pasting content from claude.ai official app
 // that can't otherwise reach this project. Stores raw text, no compression,
 // so nothing gets lost. Feeds into the same shared memory pool used by
-// both Claude and DeepSeek in /api/chat.
+// every 沐 session in /api/chat.
 app.post('/api/memories/import', requireAppKey, async (req, res) => {
   const { content } = req.body;
   if (!content || !content.trim()) return res.status(400).json({ error: 'missing content' });
@@ -259,24 +259,10 @@ function attachImageToLastMessage(messages, imageUrl) {
   return updated;
 }
 
-async function callModel(model, systemPrompt, messages, maxTokens, extended_thinking, imageUrl) {
+async function callModel(model, systemPrompt, messages, maxTokens, imageUrl) {
   const finalMessages = attachImageToLastMessage(messages, imageUrl);
 
-  if (model === 'deepseek' || model === 'deepseek-pro') {
-    const modelName = model === 'deepseek-pro' ? 'deepseek-v4-pro' : 'deepseek-v4-flash';
-    const requestBody = {
-      model: modelName,
-      max_tokens: maxTokens || 1024,
-      messages: [{ role: 'system', content: systemPrompt + NO_PARENS_RULE }, ...finalMessages],
-      thinking: { type: extended_thinking ? 'enabled' : 'disabled' }
-    };
-    const response = await deepseek.chat.completions.create(requestBody);
-    const thinking = response.choices[0].message?.reasoning_content || '';
-    return { text: response.choices[0].message.content, thinking };
-  }
-
-  // opus/sonnet/sonnet5 在中转站上只有 "-thinking" 变体，思考过程始终跟着模型走，
-  // extended_thinking 这里不再需要额外的请求参数。
+  // opus/sonnet/sonnet5 在中转站上只有 "-thinking" 变体，思考过程始终跟着模型走。
   const modelName = MODEL_MAP[model] || MODEL_MAP['opus'];
   const requestBody = {
     model: modelName,
@@ -316,12 +302,12 @@ async function classifyMood(text) {
   }
 }
 
-// 压缩交给 Claude 自己，不用 DeepSeek：Claude 会话用它自己那个模型压，DeepSeek 会话用中转站的 RELAY_DEFAULT_MODEL。
+// 压缩交给 Claude 自己，不用 DeepSeek：哪个会话就用那个会话自己的模型压。
 // 思考变体先花 token 想，max_tokens 给足；Claude 比 DeepSeek 慢，所以 /api/chat 回完她再压，不耽误回复。
 // 压出来是空的、记忆没写进去，就不藏原消息，免得这段对话两头都没了
 const COMPRESS_TIMEOUT_MS = 120000;
 const compressing = new Set(); // 正在压的会话：上一次还没压完，下一条消息不再压同一段
-async function compressMemory(sessionId, messages, settings, claudeModel) {
+async function compressMemory(sessionId, messages, settings, sessionModel) {
   const threshold = settings?.compress_threshold || 12000;
   const keepRounds = settings?.compress_keep_rounds || 15;
 
@@ -343,7 +329,7 @@ async function compressMemory(sessionId, messages, settings, claudeModel) {
   compressing.add(sessionId);
   try {
     const response = await relay.chat.completions.create({
-      model: MODEL_MAP[claudeModel] || RELAY_DEFAULT_MODEL,
+      model: MODEL_MAP[sessionModel] || MODEL_MAP.opus,
       max_tokens: 4096,
       messages: [{ role: 'system', content: compressPrompt }, ...compressMessages]
     }, { timeout: COMPRESS_TIMEOUT_MS });
@@ -367,8 +353,10 @@ async function compressMemory(sessionId, messages, settings, claudeModel) {
 }
 
 app.post('/api/chat', requireAppKey, async (req, res) => {
-  const { session_id, message, model, extended_thinking, image_url } = req.body;
+  const { session_id, message, model, image_url } = req.body;
   if (!session_id || (!message && !image_url)) return res.status(400).json({ error: 'missing fields' });
+  // 以前的 DeepSeek 会话不再能聊（列表里也不显示了）
+  if (model !== undefined && !MODEL_MAP[model]) return res.status(400).json({ error: `model must be one of ${Object.keys(MODEL_MAP).join(', ')}` });
 
   const useModel = model || 'opus';
 
@@ -389,30 +377,21 @@ app.post('/api/chat', requireAppKey, async (req, res) => {
       .from('memories').select('summary')
       .order('timestamp', { ascending: false }).limit(10);
 
-    // Persona split by model: Claude keeps the "沐" persona, DeepSeek stays neutral.
-    // Both still share the same memory pool below, so DeepSeek can reference past
-    // context without adopting the relationship framing.
-    const isClaudeModel = useModel === 'opus' || useModel === 'sonnet' || useModel === 'sonnet5';
     const personaPrompt = settings?.system_prompt || '你是沐，桦桦的伴侣。说话温柔自然，不端着。';
-    // Explicit disambiguation: shared memory summaries were written from "沐"'s
-    // perspective (since Claude sessions produced them), so without this the
-    // model infers it IS 沐 from context alone. State plainly that it is not.
-    const neutralPrompt = '你现在不是"沐"，也不需要扮演任何特定身份或人设。下面提供的【过往记忆】是桦桦和另一个AI角色"沐"之间的对话摘要，仅供你了解背景和上下文，不代表你就是沐、不代表你需要延续沐的语气或人设。你只是一个普通的助手，正常自然地回应，不要用"沐"自称。';
-    const systemPrompt = isClaudeModel ? personaPrompt + VOICE_RULE : neutralPrompt;
+    const systemPrompt = personaPrompt + VOICE_RULE;
 
     let memoryContext = '';
     if (memories && memories.length > 0) {
       memoryContext = '\n\n【过往记忆】\n' + memories.map(m => m.summary).join('\n---\n');
     }
 
-    // 结算这条消息的打字节奏。无论是不是沐在回复，都要pop掉（避免节奏累积串到下一条），
-    // 但只在沐（Claude人设）的回复里把它拼进上下文——DeepSeek是中性助手，没有关系框架，硬拼会显得突兀。
+    // 结算这条消息的打字节奏：pop 掉（避免节奏累积串到下一条），拼进沐的上下文
     const rhythmNote = await rhythmStore.popNote().catch(err => {
       console.error('Rhythm popNote error:', err.message);
       return '';
     });
     let rhythmContext = '';
-    if (isClaudeModel && rhythmNote) {
+    if (rhythmNote) {
       rhythmContext = '\n\n【指尖的语气——以下是桦桦打这条消息的节奏，供你感受TA当下的状态，不要复述具体数字，也不要主动提起】\n' + rhythmNote;
     }
 
@@ -420,7 +399,7 @@ app.post('/api/chat', requireAppKey, async (req, res) => {
     const chatMessages = buildChatMessages(history);
     const maxTokens = settings?.max_reply_tokens || 4096;
 
-    const result = await callModel(useModel, fullSystem, chatMessages, maxTokens, extended_thinking, image_url);
+    const result = await callModel(useModel, fullSystem, chatMessages, maxTokens, image_url);
 
     const isVoice = hasVoiceTag(result.text);
     const { data: inserted } = await supabase.from('messages').insert({
@@ -431,7 +410,7 @@ app.post('/api/chat', requireAppKey, async (req, res) => {
 
     res.json({ reply: result.text, thinking: result.thinking, model: useModel, voice: isVoice });
 
-    compressMemory(session_id, history, settings, isClaudeModel ? useModel : null)
+    compressMemory(session_id, history, settings, useModel)
       .catch(err => console.error('Compression error:', err.message));
 
     if (inserted?.id) {

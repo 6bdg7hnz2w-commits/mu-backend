@@ -543,3 +543,8 @@ test('压缩：Claude 会话用它自己的模型压（走中转站，不走 Dee
   }).catch(() => null);
   assert.ok(memories, 'compressed memory saved');
 });
+
+test('DeepSeek 不再当聊天对象：建会话、聊天传 deepseek → 400', async () => {
+  assert.equal((await post('/api/sessions', { name: 'x', model: 'deepseek' })).status, 400);
+  assert.equal((await post('/api/chat', { session_id: 1, message: 'hi', model: 'deepseek-pro' })).status, 400);
+});
