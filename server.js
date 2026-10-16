@@ -138,7 +138,7 @@ app.put('/api/memories/:id', requireAppKey, async (req, res) => {
 });
 
 // === 打字节奏 ===
-// 前端探针每隔几秒ping一次，只上报"正在打字"这个事实，不携带任何内容。
+// 沐 (CC) 聊天页的输入框每隔几秒 ping 一次，只上报"正在打字"这个事实，不携带任何内容；发消息时在 /api/cc/send 结算
 
 app.post('/api/typing/ping', requireAppKey, async (req, res) => {
   try {
@@ -1245,11 +1245,14 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
   if (clientId !== undefined && !isCcId(clientId)) return res.status(400).json({ error: 'client_id must be 1-64 letters, digits, - or _' });
   const kind = req.body?.kind ?? 'chat';
   if (!CC_KINDS.has(kind)) return res.status(400).json({ error: `kind must be one of ${[...CC_KINDS].join(', ')}` });
+  // 打字节奏（fingertips）：结算这条消息是怎么打出来的，跟消息一起交给 bridge。
+  // CC 接时 bridge 附在她这条后面给他看，API 接时 lib/apiTurn.js 放进 system；只有时间，没有内容
+  const rhythm = await rhythmStore.popNote().catch(err => { console.error('Rhythm popNote error:', err.message); return ''; });
   try {
     const r = await fetch(`${bridge.url}/send`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, kind, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}), ...(clientId ? { client_id: clientId } : {}) }),
+      body: JSON.stringify({ text, kind, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}), ...(clientId ? { client_id: clientId } : {}), ...(rhythm ? { rhythm: rhythm.slice(0, 500) } : {}) }),
       signal: AbortSignal.timeout(15000)
     });
     if (!r.ok) {
