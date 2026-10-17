@@ -6,6 +6,8 @@ const OpenAI = require('openai');
 const multer = require('multer');
 const { makeRhythmStore } = require('./lib/rhythmStore');
 const { fetchFileTypes, checkFile } = require('./lib/ccFiles');
+const { findOption, publicCatalog, keyEnvName } = require('./lib/apiModels');
+const { makeApiTurns } = require('./lib/apiTurn');
 const crypto = require('node:crypto');
 
 process.on('uncaughtException', (err) => {
@@ -80,15 +82,8 @@ function hasVoiceTag(text) {
   return /<voice>[\s\S]*?<\/voice>/.test(text || '');
 }
 
-// 中转站的模型名是站点自定义的，和 OpenRouter 的 "anthropic/claude-*" 命名不一样。
-// 方括号渠道标签是模型名字符串本身的一部分（不是装饰），少了就会 503 no available channel。
-const MODEL_MAP = {
-  'opus': '[C]claude-opus-4-6-thinking',
-  'sonnet': '[C1]claude-sonnet-4-6-thinking',
-  'sonnet5': '[C1]claude-sonnet-5-thinking',
-  'deepseek': 'deepseek-v4-flash',
-  'deepseek-pro': 'deepseek-v4-pro'
-};
+// 中转站的模型名是站点自定义的，方括号渠道标签是模型名字符串本身的一部分（不是装饰），少了就会 503 no available channel。
+// 聊天只剩沐 (CC) 那一条线，API 替班能选的模型在 lib/apiModels.js；DeepSeek 只做情绪标签、你画我猜出题这些杂活
 
 // 你画我猜、日记生成用这个：不需要走聊天用的 thinking 变体，
 // 用普通的 sonnet-4-6。
@@ -98,40 +93,6 @@ app.get('/health', (req, res) => {
   // ttsCacheReady / dbServiceKey 只是"这把 key 有没有被进程读到"的布尔值，不泄露 key 本身，用来在没有
   // Render 日志权限的情况下也能从外面确认 SUPABASE_SERVICE_KEY 是不是真的生效了。
   res.json({ status: 'ok', message: '沐在这里', ttsCacheReady: !!ttsStorage, dbServiceKey: !!serviceKey });
-});
-
-// === 会话 ===
-
-app.get('/api/sessions', requireAppKey, async (req, res) => {
-  const { data, error } = await supabase
-    .from('sessions').select('*').order('updated_at', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-app.post('/api/sessions', requireAppKey, async (req, res) => {
-  const { name, model } = req.body;
-  const { data, error } = await supabase
-    .from('sessions').insert({ name: name || '新对话', model: model || 'opus' }).select().single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-app.delete('/api/sessions/:id', requireAppKey, async (req, res) => {
-  await supabase.from('messages').delete().eq('session_id', req.params.id);
-  const { error } = await supabase.from('sessions').delete().eq('id', req.params.id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true });
-});
-
-app.get('/api/sessions/:id/messages', requireAppKey, async (req, res) => {
-  const { data, error } = await supabase
-    .from('messages').select('*')
-    .eq('session_id', req.params.id)
-    .eq('visible', true)
-    .order('created_at', { ascending: true });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
 });
 
 // === 记忆 ===
@@ -147,7 +108,7 @@ app.get('/api/memories', requireAppKey, async (req, res) => {
 // Manual memory import — for pasting content from claude.ai official app
 // that can't otherwise reach this project. Stores raw text, no compression,
 // so nothing gets lost. Feeds into the same shared memory pool used by
-// both Claude and DeepSeek in /api/chat.
+// 沐 when API is answering (lib/apiTurn.js).
 app.post('/api/memories/import', requireAppKey, async (req, res) => {
   const { content } = req.body;
   if (!content || !content.trim()) return res.status(400).json({ error: 'missing content' });
@@ -177,7 +138,7 @@ app.put('/api/memories/:id', requireAppKey, async (req, res) => {
 });
 
 // === 打字节奏 ===
-// 前端探针每隔几秒ping一次，只上报"正在打字"这个事实，不携带任何内容。
+// 沐 (CC) 聊天页的输入框每隔几秒 ping 一次，只上报"正在打字"这个事实，不携带任何内容；发消息时在 /api/cc/send 结算
 
 app.post('/api/typing/ping', requireAppKey, async (req, res) => {
   try {
@@ -210,10 +171,9 @@ app.post('/api/upload', requireAppKey, (req, res) => {
   });
 });
 
-// === 聊天 ===
+// === 拼上下文用的小工具（API 替班，lib/apiTurn.js）===
 
-// [用户/助手 MM-DD HH:mm] 前缀 + 断口分隔，只用于拼给AI模型的上下文，
-// 不改动数据库里的content原文，也不影响前端聊天界面显示。
+// 给模型看的 [MM-DD HH:mm]（上海时间），只拼进上下文，不改记录原文
 function formatChatTimestamp(created_at) {
   const parts = new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',
@@ -223,17 +183,6 @@ function formatChatTimestamp(created_at) {
   return `${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`;
 }
 
-function buildChatMessages(history) {
-  const result = [];
-  for (const m of history) {
-    const roleLabel = m.role === 'user' ? '用户' : '助手';
-    const moodSuffix = m.role === 'assistant' && m.mood ? ` · ${m.mood}` : '';
-    const prefix = `[${roleLabel} ${formatChatTimestamp(m.created_at)}${moodSuffix}]`;
-    result.push({ role: m.role, content: `${prefix} ${m.content}` });
-  }
-  return result;
-}
-
 function estimateTokens(text) {
   if (!text) return 0;
   const chinese = (text.match(/[\u4e00-\u9fff]/g) || []).length;
@@ -241,58 +190,10 @@ function estimateTokens(text) {
   return chinese * 2 + Math.ceil(rest / 4);
 }
 
-// 只对最新一条用户消息（数组最后一项）做图片处理，历史消息里的图片标记保持纯文本省token。
-function attachImageToLastMessage(messages, imageUrl) {
-  if (!imageUrl || messages.length === 0) return messages;
-  const lastIdx = messages.length - 1;
-  const last = messages[lastIdx];
-  const updated = messages.slice();
-  updated[lastIdx] = {
-    ...last,
-    content: [
-      { type: 'text', text: last.content },
-      { type: 'image_url', image_url: { url: imageUrl } }
-    ]
-  };
-  return updated;
-}
-
-async function callModel(model, systemPrompt, messages, maxTokens, extended_thinking, imageUrl) {
-  const finalMessages = attachImageToLastMessage(messages, imageUrl);
-
-  if (model === 'deepseek' || model === 'deepseek-pro') {
-    const modelName = model === 'deepseek-pro' ? 'deepseek-v4-pro' : 'deepseek-v4-flash';
-    const requestBody = {
-      model: modelName,
-      max_tokens: maxTokens || 1024,
-      messages: [{ role: 'system', content: systemPrompt + NO_PARENS_RULE }, ...finalMessages],
-      thinking: { type: extended_thinking ? 'enabled' : 'disabled' }
-    };
-    const response = await deepseek.chat.completions.create(requestBody);
-    const thinking = response.choices[0].message?.reasoning_content || '';
-    return { text: response.choices[0].message.content, thinking };
-  }
-
-  // opus/sonnet/sonnet5 在中转站上只有 "-thinking" 变体，思考过程始终跟着模型走，
-  // extended_thinking 这里不再需要额外的请求参数。
-  const modelName = MODEL_MAP[model] || MODEL_MAP['opus'];
-  const requestBody = {
-    model: modelName,
-    max_tokens: maxTokens || 4096,
-    messages: [{ role: 'system', content: systemPrompt }, ...finalMessages]
-  };
-  const response = await relay.chat.completions.create(requestBody);
-
-  const choice = response.choices[0];
-  const thinking = choice.message?.reasoning_content || choice.message?.thinking || '';
-  return { text: choice.message.content, thinking };
-}
-
 const MOOD_LABELS = ['happy', 'sad', 'calm', 'tired', 'loving', 'curious', 'playful', 'confused', 'awkward', 'angry', 'speechless'];
 
-// Lightweight post-hoc classification of an assistant reply's emotional tone.
-// Runs on deepseek (cheap/fast) after the reply is already sent to the user,
-// so it never adds latency to /api/chat.
+// 给沐的回复打情绪标签（DeepSeek 便宜快），回复已经发出去之后才跑，不加延迟。
+// 现在只有 API 替班的回复会过这里（CC 的回复不经后端），结果给 mochi 用
 async function classifyMood(text) {
   const prompt = '你是一个情绪分类器。阅读下面这段回复文本，判断说话者当下的情绪基调，只能从这些标签里选一个：' +
     MOOD_LABELS.join(', ') + '。只输出标签本身，不要输出任何其他文字或标点。';
@@ -314,132 +215,20 @@ async function classifyMood(text) {
   }
 }
 
-async function compressMemory(sessionId, messages, settings) {
-  const threshold = settings.compress_threshold || 12000;
-  const keepRounds = settings.compress_keep_rounds || 15;
-
-  let totalTokens = 0;
-  for (const m of messages) totalTokens += estimateTokens(m.content);
-  if (totalTokens < threshold) return;
-
-  const keepCount = keepRounds * 2;
-  if (messages.length <= keepCount) return;
-
-  const toCompress = messages.slice(0, messages.length - keepCount);
-  const compressPrompt = '你是一个记忆压缩助手。请将对话压缩成简短的记忆摘要，保留关键信息、情感和重要细节，用第三人称描述。';
-  const compressMessages = [{
-    role: 'user',
-    content: '请压缩以下对话：\n\n' + toCompress.map(m => m.role + ': ' + m.content).join('\n')
-  }];
-
-  try {
-    const result = await callModel('deepseek', compressPrompt, compressMessages, 1024);
-    await supabase.from('memories').insert({
-      summary: result.text,
-      session_id: 'global',
-      conversation_id: String(sessionId),
-      timestamp: new Date().toISOString()
-    });
-    const ids = toCompress.map(m => m.id);
-    await supabase.from('messages').update({ visible: false }).in('id', ids);
-    console.log('Compressed ' + toCompress.length + ' messages');
-  } catch (err) {
-    console.error('Compression error:', err.message);
-  }
-}
-
-app.post('/api/chat', requireAppKey, async (req, res) => {
-  const { session_id, message, model, extended_thinking, image_url } = req.body;
-  if (!session_id || (!message && !image_url)) return res.status(400).json({ error: 'missing fields' });
-
-  const useModel = model || 'opus';
-
-  try {
-    const userContent = image_url ? `${message}\n[图片: ${image_url}]` : message;
-    await supabase.from('messages').insert({
-      session_id, role: 'user', content: userContent, visible: true
-    });
-
-    const { data: history } = await supabase
-      .from('messages').select('*')
-      .eq('session_id', session_id).eq('visible', true)
-      .order('created_at', { ascending: true });
-
-    const { data: settings } = await supabase.from('settings').select('*').single();
-
-    const { data: memories } = await supabase
-      .from('memories').select('summary')
-      .order('timestamp', { ascending: false }).limit(10);
-
-    // Persona split by model: Claude keeps the "沐" persona, DeepSeek stays neutral.
-    // Both still share the same memory pool below, so DeepSeek can reference past
-    // context without adopting the relationship framing.
-    const isClaudeModel = useModel === 'opus' || useModel === 'sonnet' || useModel === 'sonnet5';
-    const personaPrompt = settings?.system_prompt || '你是沐，桦桦的伴侣。说话温柔自然，不端着。';
-    // Explicit disambiguation: shared memory summaries were written from "沐"'s
-    // perspective (since Claude sessions produced them), so without this the
-    // model infers it IS 沐 from context alone. State plainly that it is not.
-    const neutralPrompt = '你现在不是"沐"，也不需要扮演任何特定身份或人设。下面提供的【过往记忆】是桦桦和另一个AI角色"沐"之间的对话摘要，仅供你了解背景和上下文，不代表你就是沐、不代表你需要延续沐的语气或人设。你只是一个普通的助手，正常自然地回应，不要用"沐"自称。';
-    const systemPrompt = isClaudeModel ? personaPrompt + VOICE_RULE : neutralPrompt;
-
-    let memoryContext = '';
-    if (memories && memories.length > 0) {
-      memoryContext = '\n\n【过往记忆】\n' + memories.map(m => m.summary).join('\n---\n');
-    }
-
-    // 结算这条消息的打字节奏。无论是不是沐在回复，都要pop掉（避免节奏累积串到下一条），
-    // 但只在沐（Claude人设）的回复里把它拼进上下文——DeepSeek是中性助手，没有关系框架，硬拼会显得突兀。
-    const rhythmNote = await rhythmStore.popNote().catch(err => {
-      console.error('Rhythm popNote error:', err.message);
-      return '';
-    });
-    let rhythmContext = '';
-    if (isClaudeModel && rhythmNote) {
-      rhythmContext = '\n\n【指尖的语气——以下是桦桦打这条消息的节奏，供你感受TA当下的状态，不要复述具体数字，也不要主动提起】\n' + rhythmNote;
-    }
-
-    const fullSystem = systemPrompt + memoryContext + rhythmContext;
-    const chatMessages = buildChatMessages(history);
-    const maxTokens = settings?.max_reply_tokens || 4096;
-
-    const result = await callModel(useModel, fullSystem, chatMessages, maxTokens, extended_thinking, image_url);
-
-    const isVoice = hasVoiceTag(result.text);
-    const { data: inserted } = await supabase.from('messages').insert({
-      session_id, role: 'assistant', content: result.text, thinking: result.thinking || null, visible: true, voice: isVoice
-    }).select().single();
-
-    await supabase.from('sessions').update({ updated_at: new Date().toISOString() }).eq('id', session_id);
-    await compressMemory(session_id, history, settings);
-
-    res.json({ reply: result.text, thinking: result.thinking, model: useModel, voice: isVoice });
-
-    if (inserted?.id) {
-      classifyMood(result.text).then(async (mood) => {
-        if (!mood) return;
-        await supabase.from('messages').update({ mood }).eq('id', inserted.id);
-      }).catch(err => console.error('Mood tagging error:', err.message));
-    }
-  } catch (err) {
-    console.error('Chat error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // === mochi ===
 
 const MOOD_ACTIVE_WINDOW_MS = 5 * 60 * 1000;
 
-app.get('/api/mochi/mood', async (req, res) => {
-  const { data, error } = await supabase
-    .from('messages').select('id, mood, created_at')
-    .eq('role', 'assistant').eq('visible', true)
-    .order('created_at', { ascending: false })
-    .limit(1);
-  if (error) return res.status(500).json({ error: error.message });
+// 最近一条打过标签的回复：{ id, mood, at }。只在内存里，重启清空（mochi 会当没人说话）
+let latestMood = null;
+function tagMood(id, text) {
+  classifyMood(text).then((mood) => { if (mood) latestMood = { id, mood, at: Date.now() }; })
+    .catch(err => console.error('Mood tagging error:', err.message));
+}
 
-  const latest = data && data[0];
-  const active = !!latest && (Date.now() - new Date(latest.created_at).getTime()) < MOOD_ACTIVE_WINDOW_MS;
+app.get('/api/mochi/mood', (req, res) => {
+  const latest = latestMood;
+  const active = !!latest && (Date.now() - latest.at) < MOOD_ACTIVE_WINDOW_MS;
   const mood = latest?.mood || 'calm';
   const poll_interval = active ? 3 : Math.floor(Math.random() * 6) + 15;
 
@@ -1426,6 +1215,9 @@ function bridgeConfig() {
   return url && token ? { url, token } : null;
 }
 
+// 切到 API 时替沐回消息的那一套（lib/apiTurn.js）；/send、/retry 看到 bridge 回 brain:"api" 就交给它
+const apiTurns = makeApiTurns({ bridgeConfig, supabase, voiceRule: VOICE_RULE, formatTime: formatChatTimestamp, estimateTokens, onReply: tagMood });
+
 // 图片 + 文件一次最多几个看白名单里的 max_items；白名单拉不到时按 9 算（bridge 那边还会再卡一次）
 const CC_MAX_ITEMS_FALLBACK = 9;
 // 前端给每条消息的 client_id、消息 id：后端只卡类型和长度，去重、找消息都是 bridge 的事
@@ -1453,11 +1245,14 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
   if (clientId !== undefined && !isCcId(clientId)) return res.status(400).json({ error: 'client_id must be 1-64 letters, digits, - or _' });
   const kind = req.body?.kind ?? 'chat';
   if (!CC_KINDS.has(kind)) return res.status(400).json({ error: `kind must be one of ${[...CC_KINDS].join(', ')}` });
+  // 打字节奏（fingertips）：结算这条消息是怎么打出来的，跟消息一起交给 bridge。
+  // CC 接时 bridge 附在她这条后面给他看，API 接时 lib/apiTurn.js 放进 system；只有时间，没有内容
+  const rhythm = await rhythmStore.popNote().catch(err => { console.error('Rhythm popNote error:', err.message); return ''; });
   try {
     const r = await fetch(`${bridge.url}/send`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, kind, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}), ...(clientId ? { client_id: clientId } : {}) }),
+      body: JSON.stringify({ text, kind, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}), ...(clientId ? { client_id: clientId } : {}), ...(rhythm ? { rhythm: rhythm.slice(0, 500) } : {}) }),
       signal: AbortSignal.timeout(15000)
     });
     if (!r.ok) {
@@ -1466,7 +1261,9 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
       return res.status(r.status === 400 ? 400 : 502).json({ error: r.status === 400 && data.error ? data.error : `bridge ${r.status}` });
     }
     const data = await r.json().catch(() => ({}));
-    res.json({ ok: true, id: data.id, time: data.time, ...(Number.isSafeInteger(data.seq) ? { seq: data.seq } : {}) });
+    const brain = data.brain === 'api' || data.brain === 'cc' ? data.brain : undefined;
+    res.json({ ok: true, id: data.id, time: data.time, ...(Number.isSafeInteger(data.seq) ? { seq: data.seq } : {}), ...(brain ? { brain } : {}) });
+    if (brain === 'api') apiTurns.enqueue(data.id);
   } catch (err) {
     console.error('CC bridge send error:', err.message);
     res.status(502).json({ error: 'bridge unreachable' });
@@ -1474,7 +1271,8 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
 });
 
 // 带 BRIDGE_TOKEN 把 JSON POST 给 bridge；bridge 的 400/404/409（参数不对、找不到、不用重发）原样回给前端，别的算 502
-async function forwardCcPost(res, path, body) {
+// onOk：成功时拿 bridge 的响应再做点事（回完前端之后）
+async function forwardCcPost(res, path, body, onOk) {
   const bridge = bridgeConfig();
   if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
   try {
@@ -1490,9 +1288,10 @@ async function forwardCcPost(res, path, body) {
       return res.status([400, 404, 409].includes(r.status) ? r.status : 502).json({ error: data.error || `bridge ${r.status}` });
     }
     res.json(data);
+    onOk?.(data);
   } catch (err) {
     console.error(`CC bridge ${path} error:`, err.message);
-    res.status(502).json({ error: 'bridge unreachable' });
+    if (!res.headersSent) res.status(502).json({ error: 'bridge unreachable' });
   }
 }
 
@@ -1509,7 +1308,73 @@ app.post('/api/cc/edit', requireAppKey, (req, res) => {
 app.post('/api/cc/retry', requireAppKey, (req, res) => {
   const id = req.body?.id;
   if (!isCcId(id)) return res.status(400).json({ error: 'id required' });
-  return forwardCcPost(res, '/retry', { id });
+  // API 模式下 bridge 不叫 CC，回 brain:"api"，由这边重跑一轮
+  return forwardCcPost(res, '/retry', { id }, (data) => { if (data?.brain === 'api') apiTurns.enqueue(id); });
+});
+
+// === 回复方式：CC / API（docs/api-mode.md）===
+
+// 能选的模型和分组；ready 表示这个分组的 key 在环境变量里配了
+app.get('/api/cc/api-models', requireAppKey, (req, res) => res.json(publicCatalog()));
+
+// bridge 的 /brain 加上选中模型在目录里的样子
+function brainView(brain) {
+  if (!brain) return { supported: false, target: 'cc', model: null, group: null, option: null, family: null };
+  const model = typeof brain.api_model === 'string' ? brain.api_model : null;
+  const group = typeof brain.api_group === 'string' ? brain.api_group : null;
+  const found = model && group ? findOption(model, group) : null;
+  return { supported: true, target: brain.target === 'api' ? 'api' : 'cc', model, group, option: found?.option || null, family: found?.family || null };
+}
+
+app.get('/api/cc/brain', requireAppKey, async (req, res) => {
+  if (!bridgeConfig()) return res.status(500).json({ error: 'bridge not configured' });
+  try {
+    res.json(brainView(await apiTurns.getBrain()));
+  } catch (err) {
+    console.error('CC bridge brain error:', err.message);
+    res.status(502).json({ error: 'bridge unreachable' });
+  }
+});
+
+// { target:'cc' } / { target:'api' }（用上次选的，没选过用默认）/ { target:'api', model, group }（选模型）
+app.post('/api/cc/brain', requireAppKey, async (req, res) => {
+  if (!bridgeConfig()) return res.status(500).json({ error: 'bridge not configured' });
+  const { target, model, group } = req.body || {};
+  if (target !== 'cc' && target !== 'api') return res.status(400).json({ error: 'target must be cc or api' });
+  if ((model !== undefined || group !== undefined) && !(typeof model === 'string' && typeof group === 'string')) {
+    return res.status(400).json({ error: 'model and group must be given together' });
+  }
+  try {
+    const body = { target };
+    if (target === 'api' || model !== undefined) {
+      let found;
+      if (model !== undefined) {
+        found = findOption(model, group);
+        if (!found) return res.status(400).json({ error: `没有这个模型：${group} / ${model}` });
+      } else {
+        const current = await apiTurns.getBrain();
+        if (!current) return res.status(501).json({ error: 'bridge 还没更新，不能切换' });
+        found = apiTurns.resolveOption(current);
+      }
+      if (!found.option.ready) return res.status(400).json({ error: `中转站的 key 没配（RELAY_API_KEY，或者分组单独的 ${keyEnvName(found.option.group)}）` });
+      Object.assign(body, { api_model: found.option.model, api_group: found.option.group });
+    }
+    const r = await apiTurns.bridgeFetch('/brain', { method: 'POST', body });
+    if (r.status === 404) return res.status(501).json({ error: 'bridge 还没更新，不能切换' });
+    if (!r.ok) return res.status(r.status === 400 ? 400 : 502).json({ error: r.data?.error || `bridge ${r.status}` });
+    res.json(brainView(r.data));
+  } catch (err) {
+    console.error('CC bridge brain error:', err.message);
+    res.status(502).json({ error: 'bridge unreachable' });
+  }
+});
+
+// 设置页"测试一下"：真调一次，看这个模型 + 分组通不通
+app.post('/api/cc/api-test', requireAppKey, async (req, res) => {
+  const { model, group } = req.body || {};
+  const found = typeof model === 'string' && typeof group === 'string' ? findOption(model, group) : null;
+  if (!found) return res.status(400).json({ error: 'unknown model / group' });
+  res.json(await apiTurns.testModel(found.option));
 });
 
 // 图片和文件上传：multipart，字段名 image（图片，和以前一样）或 file（文件，白名单见 lib/ccFiles.js）

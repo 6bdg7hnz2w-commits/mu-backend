@@ -162,7 +162,7 @@ test('usage：brief/days/hours 透传给 bridge，别的参数和非数字不透
   await fetch(`${BASE}/api/cc/usage?days=30&hours=48&x=1`, { headers: AUTH });
   assert.equal(lastUsage(), '/usage?days=30&hours=48');
   await fetch(`${BASE}/api/cc/usage?days=abc&hours=1e9&brief=yes`, { headers: AUTH });
-  assert.equal(lastUsage(), '/usage?');
+  assert.equal(lastUsage(), '/usage'); // 一个参数都不透传时 fetch 会把空的 ? 去掉
 });
 
 test('usage 不带口令 → 401，不会转给 bridge', async () => {

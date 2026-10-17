@@ -39,9 +39,8 @@ const PROTECTED = [
   ['GET', '/api/events?from=2026-10-01&to=2026-10-31'], ['POST', '/api/events', {}], ['PUT', '/api/events/1', {}], ['DELETE', '/api/events/1'], ['POST', '/api/events/sync', {}],
   ['GET', '/api/letters'], ['POST', '/api/letters', {}], ['POST', '/api/letters/1/read'],
   ['GET', '/api/auth/check'],
-  ['GET', '/api/sessions'], ['POST', '/api/sessions', {}], ['DELETE', '/api/sessions/1'], ['GET', '/api/sessions/1/messages'],
   ['GET', '/api/memories'], ['POST', '/api/memories/import', { content: 'x' }], ['DELETE', '/api/memories/1'], ['PUT', '/api/memories/1', { summary: 'x' }],
-  ['POST', '/api/typing/ping'], ['POST', '/api/upload'], ['POST', '/api/chat', { session_id: 1, message: 'x' }],
+  ['POST', '/api/typing/ping'], ['POST', '/api/upload'],
   ['GET', '/api/diaries'], ['POST', '/api/diaries', { author: 'her', content: 'x' }], ['PUT', '/api/diaries/1', { content: 'x' }], ['DELETE', '/api/diaries/1'],
   ['GET', '/api/whispers/today'], ['POST', '/api/tts', { text: 'hi' }], ['GET', '/api/tts/duration?text=hi'],
   ['POST', '/api/games/draw-guess/start'], ['POST', '/api/games/draw-guess/guess', { image: 'x' }],
@@ -51,6 +50,8 @@ const PROTECTED = [
   ['POST', '/api/nook/books/1/chapters/1/ai-annotate'],
   ['POST', '/api/cc/send', { text: 'x' }], ['POST', '/api/cc/upload'], ['GET', '/api/cc/file-types'], ['GET', '/api/cc/uploads/2026-10-09/x.pdf'], ['GET', '/api/cc/history'],
   ['POST', '/api/cc/edit', { id: 'm1', text: 'x' }], ['POST', '/api/cc/retry', { id: 'm1' }], ['GET', '/api/cc/history?system=1'],
+  ['GET', '/api/cc/api-models'], ['GET', '/api/cc/brain'], ['POST', '/api/cc/brain', { target: 'cc' }],
+  ['POST', '/api/cc/api-test', { model: '[K]claude-opus-4-6', group: 'default' }],
 ];
 // 输错口令有按 IP 的限速，每条用例换一个 X-Forwarded-For，互不影响
 let ipSeq = 0;
