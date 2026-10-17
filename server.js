@@ -142,7 +142,7 @@ app.put('/api/memories/:id', requireAppKey, async (req, res) => {
 
 app.post('/api/typing/ping', requireAppKey, async (req, res) => {
   try {
-    await rhythmStore.ping();
+    await rhythmStore.ping(req.body?.deleted);
     res.json({ ok: true });
   } catch (err) {
     console.error('Typing ping error:', err.message);
@@ -1245,9 +1245,9 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
   if (clientId !== undefined && !isCcId(clientId)) return res.status(400).json({ error: 'client_id must be 1-64 letters, digits, - or _' });
   const kind = req.body?.kind ?? 'chat';
   if (!CC_KINDS.has(kind)) return res.status(400).json({ error: `kind must be one of ${[...CC_KINDS].join(', ')}` });
-  // 打字节奏（fingertips）：结算这条消息是怎么打出来的，跟消息一起交给 bridge。
-  // CC 接时 bridge 附在她这条后面给他看，API 接时 lib/apiTurn.js 放进 system；只有时间，没有内容
-  const rhythm = await rhythmStore.popNote().catch(err => { console.error('Rhythm popNote error:', err.message); return ''; });
+  // 打字节奏（fingertips）：结算这条消息是怎么打出来的，跟平时不一样才有一个短标签（【节奏：慢，停了3次】），
+  // 跟消息一起交给 bridge，CC 和 API 都附在她这条后面。只有时间和删了几个字，没有内容
+  const rhythm = await rhythmStore.popNote([...text].length).catch(err => { console.error('Rhythm popNote error:', err.message); return ''; });
   try {
     const r = await fetch(`${bridge.url}/send`, {
       method: 'POST',

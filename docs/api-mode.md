@@ -95,10 +95,10 @@ API 模式下后端在回完前端之后自己排一轮 API，前端照常等 SS
 2. **`POST /send`**：`target=api` 时照常落库（id、seq、client_id 去重、图片文件校验都不变），
    **不交给 CC**，这条消息记上 `routed:"api"`，SSE 推 `{type:'typing', on:true, since}`，
    响应在原有字段外加 `brain:"api"`。`target=cc` 时行为不变，响应加 `brain:"cc"`。
-   body 里可能多一个 `rhythm`（字符串，≤500 字）：她这条是怎么打出来的（打了多久、停了几次、有没有打了没发），
-   只有时间没有内容。存在这条消息上（`/history` 里带着，API 那边要读）；**CC 接的时候**附在她这条后面交给 CC：
-   `【指尖的语气——以下是桦桦打这条消息的节奏，供你感受她当下的状态，不要复述具体数字，也不要主动提起】<rhythm>`。
-   前端不显示它。
+   body 里可能多一个 `rhythm`（字符串，≤500 字）：打字节奏的短标签，比如 `【节奏：慢，停了3次】`，
+   只在跟她平时不一样时才有（后端 lib/rhythmStore.js 拿她最近 30 条比）。存在这条消息上（`/history` 里带着，
+   API 那边跟在她这条后面给模型）；CC 接的时候也只在她这条后面附上这个标签。标签什么意思写在 persona.md 里，
+   不每条解释。前端不显示它。
 
 3. **`POST /retry {id}`**：`target=api` 时不叫 CC：找不到 404，否则 SSE 推 typing on，返回 `{ ok:true, brain:"api" }`。
    这时**不要**按"她这条后面有没有沐的话"回 409：API 回的那条 seq 可能排在她后来发的消息后面，
@@ -153,7 +153,7 @@ API 模式下后端在回完前端之后自己排一轮 API，前端照常等 SS
   其余文件、旧图片只留一句"[图片]""[文件: 名字]"。
 - **system**：`/persona`（缓存 5 分钟；404 退回 `settings.system_prompt`）+ `VOICE_RULE`
   + 一段"现在是 API 替班，没有工具"的说明 + `memories` 最近 10 条 + 沐最近两篇日记
-  + 这一轮要回的消息上的 `rhythm`（打字节奏，见第二节第 2 条）。
+  （打字节奏的短标签跟在她各条消息后面，见第二节第 2 条）。
 - **调模型**：选中的模型名原样发给中转站（`RELAY_BASE_URL`），key 按分组选（见下）。超时 180 秒。
   思考过程取 `reasoning_content` / `thinking`，或者正文开头的 `<think>…</think>` / `<thinking>…</thinking>`。
 - **回写**：成功 → `POST /reply`；失败或正文为空 → `POST /system reply_failed`（她点"再叫他一下"会重跑）。
