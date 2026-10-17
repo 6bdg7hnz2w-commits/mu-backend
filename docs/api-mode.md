@@ -166,16 +166,17 @@ API 模式下后端在回完前端之后自己排一轮 API，前端照常等 SS
 
 ## 四、中转站的 key（Render 环境变量）
 
-中转站（new-api）的"分组"跟着令牌走：一把 key 只能用它自己那个分组的模型。
+默认所有模型共用一把 `RELAY_API_KEY`。中转站（new-api）的令牌有"分组"，有的 key 只能调自己分组的模型；
+如果某个分组用共用 key 调不通（设置页"测试一下"报 no available channel），就在中转站「令牌」里建一把那个分组的，
+填进对应的环境变量，后端优先用它：
 
-| 分组 | 环境变量 | 用在 |
+| 分组 | 单独的环境变量（可选） | 用在 |
 |---|---|---|
-| default | `RELAY_API_KEY`（已有；也认 `RELAY_KEY_DEFAULT`） | 所有 Opus（A/B/K/P、hybrid） |
+| default | `RELAY_KEY_DEFAULT` | 所有 Opus（A/B/K/P、hybrid） |
 | claude-awsb | `RELAY_KEY_CLAUDE_AWSB` | Fable 5 |
 | claude-ccmax | `RELAY_KEY_CLAUDE_CCMAX` | Fable 5 |
 | claude-or | `RELAY_KEY_CLAUDE_OR` | Fable 5.1 |
 
-规则：分组名转大写、非字母数字换成 `_`，前面加 `RELAY_KEY_`。没配的分组在选择页里灰掉。
-在中转站「令牌」里新建令牌时选对应分组即可。
+规则：分组名转大写、非字母数字换成 `_`，前面加 `RELAY_KEY_`；没配就用 `RELAY_API_KEY`。
 
 可选：`API_TURN_DEBOUNCE_MS`（默认 2500）、`API_TURN_TIMEOUT_MS`（默认 180000）。

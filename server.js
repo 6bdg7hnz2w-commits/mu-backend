@@ -1356,7 +1356,7 @@ app.post('/api/cc/brain', requireAppKey, async (req, res) => {
         if (!current) return res.status(501).json({ error: 'bridge 还没更新，不能切换' });
         found = apiTurns.resolveOption(current);
       }
-      if (!found.option.ready) return res.status(400).json({ error: `分组 ${found.option.group} 的 key 没配（${found.option.group === 'default' ? 'RELAY_API_KEY' : keyEnvName(found.option.group)}）` });
+      if (!found.option.ready) return res.status(400).json({ error: `中转站的 key 没配（RELAY_API_KEY，或者分组单独的 ${keyEnvName(found.option.group)}）` });
       Object.assign(body, { api_model: found.option.model, api_group: found.option.group });
     }
     const r = await apiTurns.bridgeFetch('/brain', { method: 'POST', body });

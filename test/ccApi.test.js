@@ -121,7 +121,7 @@ const countTo = (url) => fake.seen.filter((r) => r.url === url).length;
 const useApi = (model = '[K]claude-opus-4-6-thinking', group = 'default') => { fake.brain = { target: 'api', api_model: model, api_group: group }; };
 
 // --- 模型目录 ---
-test('api-models：按截图列出模型，分组 key 没配的 ready=false', async () => {
+test('api-models：按截图列出模型，分组没单独配 key 就用共用的', async () => {
   fake.reset();
   const data = await (await get('/api/cc/api-models')).json();
   assert.deepEqual(data.default, { model: '[K]claude-opus-4-6-thinking', group: 'default' });
@@ -133,7 +133,7 @@ test('api-models：按截图列出模型，分组 key 没配的 ready=false', as
   assert.equal(byModel('[K]claude-opus-4-6').desc, 'kiro，RFv3对RP与人机恋各场景表现调优');
   assert.equal(byModel('[A]claude-hybrid2').label, 'A · hybrid2');
   assert.equal(byModel('[P]claude-opus-5-5-thinking').ready, true);
-  assert.equal(byModel('claude-fable-5', 'claude-awsb').ready, false); // RELAY_KEY_CLAUDE_AWSB 没配
+  assert.equal(byModel('claude-fable-5', 'claude-awsb').ready, true); // 没配 RELAY_KEY_CLAUDE_AWSB，用 RELAY_API_KEY
   assert.equal(byModel('claude-fable-5-1', 'claude-or').ready, true);
   assert.equal(new Set(all.map((o) => o.id)).size, all.length);
 });
@@ -187,7 +187,6 @@ for (const [name, body] of [
   ['不认识的模型', { target: 'api', model: '[Z]claude-nope', group: 'default' }],
   ['模型和分组对不上', { target: 'api', model: 'claude-fable-5', group: 'default' }],
   ['只给模型不给分组', { target: 'api', model: '[B]claude-opus-4-5' }],
-  ['分组 key 没配', { target: 'api', model: 'claude-fable-5', group: 'claude-awsb' }],
 ]) {
   test(`brain POST：${name} → 400，不转给 bridge`, async () => {
     fake.reset();
@@ -400,9 +399,9 @@ test('api-test：通的回 ok 和耗时，不通的回错误原文', async () =>
   const bad = await (await post('/api/cc/api-test', { model: '[K]claude-opus-4-7', group: 'default' })).json();
   assert.equal(bad.ok, false);
   assert.match(bad.error, /no available channel/);
-  const noKey = await (await post('/api/cc/api-test', { model: 'claude-fable-5', group: 'claude-ccmax' })).json();
-  assert.equal(noKey.ok, false);
-  assert.match(noKey.error, /RELAY_KEY_CLAUDE_CCMAX/);
+  fake.relayQueue.push({ content: 'pong' });
+  await post('/api/cc/api-test', { model: 'claude-fable-5', group: 'claude-ccmax' });
+  assert.equal(fake.relayCalls.at(-1).auth, 'Bearer key-default'); // 没单独配就用共用的 key
   assert.equal((await post('/api/cc/api-test', { model: 'gpt-4o', group: 'default' })).status, 400);
 });
 
