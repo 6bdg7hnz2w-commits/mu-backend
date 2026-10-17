@@ -15,19 +15,21 @@ test('比平时慢一倍以上、停得多、删得多 → 都标上', () => {
   assert.deepEqual(judge({ dur: 90, spc: 3, pauses: 4, deleted: 30, del: 1 }, usual), ['慢', '停了4次', '删了又打']);
 });
 
-test('打得很短的就算慢也不标（不到 20 秒）', () => {
-  assert.deepEqual(judge({ dur: 12, spc: 6, pauses: 0, deleted: 0, del: 0 }, usual), []);
+test('门槛：不到一分钟不算慢，停不到 4 次、删不到 30 个字也不标', () => {
+  assert.deepEqual(judge({ dur: 50, spc: 6, pauses: 3, deleted: 29, del: 2 }, usual), []);
 });
 
 test('平时就停得多的人，停 3 次不算反常', () => {
   const pausy = usual.map((b) => ({ ...b, pauses: 3 }));
   assert.deepEqual(judge({ dur: 40, spc: 1, pauses: 3, deleted: 0, del: 0 }, pausy), []);
   assert.deepEqual(judge({ dur: 40, spc: 1, pauses: 5, deleted: 0, del: 0 }, pausy), ['停了5次']);
+  const pausier = usual.map((b) => ({ ...b, pauses: 4 }));
+  assert.deepEqual(judge({ dur: 40, spc: 1, pauses: 5, deleted: 0, del: 0 }, pausier), []);
 });
 
 test('还没攒够平时的样子：只标很明显的', () => {
-  assert.deepEqual(judge({ dur: 40, spc: 2, pauses: 2, deleted: 12, del: 0.6 }, []), []);
-  assert.deepEqual(judge({ dur: 80, spc: 4, pauses: 3, deleted: 20, del: 1 }, []), ['慢', '停了3次', '删了又打']);
+  assert.deepEqual(judge({ dur: 40, spc: 2, pauses: 3, deleted: 25, del: 0.9 }, []), []);
+  assert.deepEqual(judge({ dur: 80, spc: 4, pauses: 4, deleted: 30, del: 1 }, []), ['慢', '停了4次', '删了又打']);
 });
 
 // 假的 rhythm_state 单行
@@ -50,7 +52,7 @@ test('popNote：攒删字数、出标签、记进平时、清空', async () => {
   const now = Date.now();
   const db = fakeDb({ pings: [now - 120000, now - 90000, now - 60000, now - 30000, now - 1000], orphan: null, deleted: 40, baseline: usual });
   const store = makeRhythmStore(db);
-  const note = await store.popNote(20); // 119 秒打 20 个字，停了 4 次，删了 40 个
+  const note = await store.popNote(20); // 119 秒打 20 个字，停了 4 次（每次 30 秒），删了 40 个
   assert.equal(note, '【节奏：慢，停了4次，删了又打】');
   assert.equal(db.row.pings.length, 0);
   assert.equal(db.row.deleted, 0);

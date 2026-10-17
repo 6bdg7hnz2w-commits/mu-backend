@@ -567,7 +567,8 @@ test('打字节奏：bridge 存在她消息上的短标签跟在她那条后面�
   fake.addMessage({ id: 'rh1', role: 'user', text: '我想你了', rhythm: '【节奏：停了3次，删了又打】', routed: 'api' });
   await post('/api/cc/retry', { id: 'rh1' });
   await waitFor(() => lastTo('/reply'));
-  const msgs = fake.relayCalls[0].body.messages;
+  // 上一个测试回完还可能晚到一次压缩请求，跳过它
+  const msgs = fake.relayCalls.find((c) => !JSON.stringify(c.body.messages).includes('记忆压缩助手')).body.messages;
   assert.doesNotMatch(msgs[0].content, /节奏/);
   assert.match(msgs[1].content, /早\n【节奏：慢】$/);
   assert.match(msgs.at(-1).content, /我想你了\n【节奏：停了3次，删了又打】$/);
