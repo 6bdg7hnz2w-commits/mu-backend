@@ -559,15 +559,16 @@ test('压缩：攒够了就把较早的一段压成记忆，前两个模型挂�
   assert.doesNotMatch(JSON.stringify(turn.body.messages.slice(1)), /"\[[^\]]*\] 0 今天的事/);
 });
 
-test('打字节奏：bridge 存在她消息上的 rhythm 放进这一轮的 system，旧消息的不放', async () => {
+test('打字节奏：bridge 存在她消息上的短标签跟在她那条后面，system 里不再解释', async () => {
   fake.reset();
   useApi();
-  fake.addMessage({ id: 'rh0', role: 'user', text: '早', rhythm: '很久以前那条的节奏' });
+  fake.addMessage({ id: 'rh0', role: 'user', text: '早', rhythm: '【节奏：慢】' });
   fake.addMessage({ id: 'rh0a', role: 'assistant', text: '早呀', via: 'api', reply_to: 'rh0' });
-  fake.addMessage({ id: 'rh1', role: 'user', text: '我想你了', rhythm: 'TA 5分钟前打过40秒的字，那条没有发出来', routed: 'api' });
+  fake.addMessage({ id: 'rh1', role: 'user', text: '我想你了', rhythm: '【节奏：停了3次，删了又打】', routed: 'api' });
   await post('/api/cc/retry', { id: 'rh1' });
   await waitFor(() => lastTo('/reply'));
-  const system = fake.relayCalls[0].body.messages[0].content;
-  assert.match(system, /【指尖的语气[^】]*】\nTA 5分钟前打过40秒的字，那条没有发出来$/);
-  assert.doesNotMatch(system, /很久以前那条的节奏/);
+  const msgs = fake.relayCalls[0].body.messages;
+  assert.doesNotMatch(msgs[0].content, /节奏/);
+  assert.match(msgs[1].content, /早\n【节奏：慢】$/);
+  assert.match(msgs.at(-1).content, /我想你了\n【节奏：停了3次，删了又打】$/);
 });
