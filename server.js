@@ -9,6 +9,8 @@ const { fetchFileTypes, checkFile } = require('./lib/ccFiles');
 const { findOption, publicCatalog, keyEnvName } = require('./lib/apiModels');
 const { makeApiTurns } = require('./lib/apiTurn');
 const crypto = require('node:crypto');
+const { Readable } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 
 process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION:', err);
@@ -1452,19 +1454,23 @@ app.get('/api/cc/file-types', requireAppKey, async (req, res) => {
 app.get('/api/cc/uploads/:date/:file', requireAppKey, async (req, res) => {
   const bridge = bridgeConfig();
   if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+  // ?thumb=1：聊天里显示的 360×360 缩略图（bridge 做不出来时回原图）
+  const qs = req.query.thumb === '1' ? '?thumb=1' : '';
   try {
-    const r = await fetch(`${bridge.url}/uploads/${encodeURIComponent(req.params.date)}/${encodeURIComponent(req.params.file)}`, {
+    const r = await fetch(`${bridge.url}/uploads/${encodeURIComponent(req.params.date)}/${encodeURIComponent(req.params.file)}${qs}`, {
       headers: { 'Authorization': `Bearer ${bridge.token}` },
       signal: AbortSignal.timeout(30000)
     });
     if (!r.ok) return res.status(r.status === 404 ? 404 : 502).json({ error: `bridge ${r.status}` });
-    res.set({ 'Content-Type': r.headers.get('content-type') || 'application/octet-stream', 'Cache-Control': 'private, max-age=86400', 'X-Content-Type-Options': 'nosniff' });
-    const disposition = r.headers.get('content-disposition');
-    if (disposition) res.set('Content-Disposition', disposition);
-    res.send(Buffer.from(await r.arrayBuffer()));
+    // 文件名是 uuid、内容不变，缓存头照 bridge 给的（一年、immutable）
+    res.set({ 'Content-Type': r.headers.get('content-type') || 'application/octet-stream', 'Cache-Control': r.headers.get('cache-control') || 'private, max-age=86400', 'X-Content-Type-Options': 'nosniff' });
+    for (const h of ['content-disposition', 'content-length']) { const v = r.headers.get(h); if (v) res.set(h, v); }
+    // 边收边发，不等整个文件收完
+    await pipeline(Readable.fromWeb(r.body), res);
   } catch (err) {
     console.error('CC bridge uploads error:', err.message);
-    res.status(502).json({ error: 'bridge unreachable' });
+    if (!res.headersSent) res.status(502).json({ error: 'bridge unreachable' });
+    else res.destroy();
   }
 });
 
