@@ -22,7 +22,8 @@ process.on('unhandledRejection', (reason, promise) => {
 
 const app = express();
 // 只允许自己的前端跨域调用。Render 上可以用 ALLOWED_ORIGINS（逗号分隔）覆盖默认值。
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://mu-frontend.onrender.com,http://localhost:5173')
+// mu0727.com 是正式域名；mu-frontend.onrender.com 过渡期继续放行
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://mu0727.com,https://mu-frontend.onrender.com,http://localhost:5173')
   .split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({ origin: ALLOWED_ORIGINS, exposedHeaders: ['X-Audio-Duration', 'Content-Disposition'] }));
 app.use(express.json({ limit: '1mb' }));
