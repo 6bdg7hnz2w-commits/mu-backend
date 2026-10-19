@@ -21,6 +21,7 @@ const TYPES = {
     { ext: 'csv', kind: 'text', mime: ['text/csv', 'application/vnd.ms-excel'] },
     { ext: 'py', kind: 'text', mime: ['application/x-python'] },
     { ext: 'docx', kind: 'office', mime: ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/zip'] },
+    { ext: 'doc', kind: 'office', mime: ['application/msword'] },
   ],
 };
 let server, bridge, bridgeUrl, cwd;
@@ -81,7 +82,7 @@ test('白名单接口：带口令拿到 bridge 的白名单', async () => {
   assert.equal(r.status, 200);
   const t = await r.json();
   assert.equal(t.max_items, 9);
-  assert.deepEqual(t.types.map((x) => x.ext), ['pdf', 'txt', 'csv', 'py', 'docx']);
+  assert.deepEqual(t.types.map((x) => x.ext), ['pdf', 'txt', 'csv', 'py', 'docx', 'doc']);
 });
 
 test('图片照旧：字段 image，转给 bridge 时不带 X-File-Name，只回 id + path', async () => {
@@ -122,13 +123,19 @@ test('docx（zip 文件头）：收，转给 bridge', async () => {
   assert.equal(decodeURIComponent(lastTo('/upload').headers['x-file-name']), '实验报告.docx');
 });
 
+test('老格式 doc（OLE 文件头）：收', async () => {
+  const r = await upload(form('file', Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0, 0]), '旧报告.doc', 'application/msword'));
+  assert.equal(r.status, 200);
+});
+
 test('代码文件：浏览器报空类型也收', async () => {
   const r = await upload(form('file', 'print(1)\n', 'a.py', ''));
   assert.equal(r.status, 200);
 });
 
 for (const [label, args] of [
-  ['白名单外的老格式 doc', ['\xd0\xcf\x11\xe0', 'a.doc', 'application/msword']],
+  ['白名单外的 pages', ['PK\x03\x04', 'a.pages', 'application/vnd.apple.pages']],
+  ['扩展名是 doc、内容不是', ['hello', 'a.doc', 'application/msword']],
   ['扩展名是 docx、内容不是 zip', ['hello', 'a.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']],
   ['没扩展名', ['hello', 'README', 'text/plain']],
   ['扩展名对、类型不对（txt 报成 image/png）', ['hello', 'a.txt', 'image/png']],
