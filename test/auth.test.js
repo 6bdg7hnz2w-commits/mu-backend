@@ -40,7 +40,7 @@ const PROTECTED = [
   ['GET', '/api/letters'], ['POST', '/api/letters', {}], ['POST', '/api/letters/1/read'],
   ['GET', '/api/auth/check'],
   ['GET', '/api/memories'], ['POST', '/api/memories/import', { content: 'x' }], ['DELETE', '/api/memories/1'], ['PUT', '/api/memories/1', { summary: 'x' }],
-  ['POST', '/api/typing/ping'], ['POST', '/api/upload'],
+  ['POST', '/api/upload'],
   ['GET', '/api/diaries'], ['POST', '/api/diaries', { author: 'her', content: 'x' }], ['PUT', '/api/diaries/1', { content: 'x' }], ['DELETE', '/api/diaries/1'],
   ['GET', '/api/whispers/today'], ['POST', '/api/tts', { text: 'hi' }], ['GET', '/api/tts/duration?text=hi'],
   ['POST', '/api/games/draw-guess/start'], ['POST', '/api/games/draw-guess/guess', { image: 'x' }],
@@ -83,7 +83,7 @@ test('同一 IP 一分钟内输错 30 次后 → 429，口令对也不放；换�
 });
 
 test('CORS 预检放行 Authorization 头', async () => {
-  const r = await fetch(BASE + '/api/typing/ping', {
+  const r = await fetch(BASE + '/api/upload', {
     method: 'OPTIONS',
     headers: { Origin: 'http://localhost:5173', 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'authorization,content-type' },
   });

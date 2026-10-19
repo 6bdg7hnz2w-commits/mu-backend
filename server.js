@@ -4,7 +4,6 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const OpenAI = require('openai');
 const multer = require('multer');
-const { makeRhythmStore } = require('./lib/rhythmStore');
 const { fetchFileTypes, checkFile } = require('./lib/ccFiles');
 const { findOption, publicCatalog, keyEnvName } = require('./lib/apiModels');
 const { makeApiTurns } = require('./lib/apiTurn');
@@ -52,8 +51,6 @@ if (!serviceKey) {
 const supabase = createClient(process.env.SUPABASE_URL, serviceKey || process.env.SUPABASE_KEY);
 // TTS 缓存：没有 service key 时不缓存（每次都重新请求 ElevenLabs），而不是让服务器起不来
 const ttsStorage = serviceKey ? supabase : null;
-
-const rhythmStore = makeRhythmStore(supabase);
 
 // 所有 Claude 调用（聊天、日记、你画我猜）统一走中转站 cn.jixiangai.xyz，
 // 不再直连 OpenRouter。RELAY_API_KEY/RELAY_BASE_URL 是共用配置。
@@ -138,19 +135,6 @@ app.put('/api/memories/:id', requireAppKey, async (req, res) => {
     .from('memories').update({ summary }).eq('id', req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
-});
-
-// === 打字节奏 ===
-// 沐 (CC) 聊天页的输入框每隔几秒 ping 一次，只上报"正在打字"这个事实，不携带任何内容；发消息时在 /api/cc/send 结算
-
-app.post('/api/typing/ping', requireAppKey, async (req, res) => {
-  try {
-    await rhythmStore.ping(req.body?.deleted);
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('Typing ping error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
 });
 
 // === 图片上传 ===
@@ -1248,14 +1232,11 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
   if (clientId !== undefined && !isCcId(clientId)) return res.status(400).json({ error: 'client_id must be 1-64 letters, digits, - or _' });
   const kind = req.body?.kind ?? 'chat';
   if (!CC_KINDS.has(kind)) return res.status(400).json({ error: `kind must be one of ${[...CC_KINDS].join(', ')}` });
-  // 打字节奏（fingertips）：结算这条消息是怎么打出来的，跟平时不一样才有一个短标签（【节奏：慢，停了3次】），
-  // 跟消息一起交给 bridge，CC 和 API 都附在她这条后面。只有时间和删了几个字，没有内容
-  const rhythm = await rhythmStore.popNote([...text].length).catch(err => { console.error('Rhythm popNote error:', err.message); return ''; });
   try {
     const r = await fetch(`${bridge.url}/send`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, kind, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}), ...(clientId ? { client_id: clientId } : {}), ...(rhythm ? { rhythm: rhythm.slice(0, 500) } : {}) }),
+      body: JSON.stringify({ text, kind, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}), ...(clientId ? { client_id: clientId } : {}) }),
       signal: AbortSignal.timeout(15000)
     });
     if (!r.ok) {

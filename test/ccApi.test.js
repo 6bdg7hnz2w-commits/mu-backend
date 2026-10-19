@@ -57,7 +57,7 @@ function makeFake() {
         return send(200, f.brain);
       }
       if (url === '/send') {
-        const m = f.addMessage({ id: `u${f.seq + 1}`, role: 'user', text: body.text, ...(body.images ? { images: body.images } : {}), ...(body.rhythm ? { rhythm: body.rhythm } : {}) });
+        const m = f.addMessage({ id: `u${f.seq + 1}`, role: 'user', text: body.text, ...(body.images ? { images: body.images } : {}) });
         return send(200, { ok: true, id: m.id, time: m.time, seq: m.seq, ...(f.hasBrain ? { brain: f.brain.target } : {}) });
       }
       if (url === '/retry') return f.brain.target === 'api' ? send(200, { ok: true, brain: 'api' }) : send(200, { ok: true });
@@ -559,7 +559,7 @@ test('压缩：攒够了就把较早的一段压成记忆，前两个模型挂�
   assert.doesNotMatch(JSON.stringify(turn.body.messages.slice(1)), /"\[[^\]]*\] 0 今天的事/);
 });
 
-test('打字节奏：bridge 存在她消息上的短标签跟在她那条后面，system 里不再解释', async () => {
+test('打字节奏（10/19 删了）：旧消息上留着的 rhythm 标签不再给模型', async () => {
   fake.reset();
   useApi();
   fake.addMessage({ id: 'rh0', role: 'user', text: '早', rhythm: '【节奏：慢】' });
@@ -569,7 +569,7 @@ test('打字节奏：bridge 存在她消息上的短标签跟在她那条后面�
   await waitFor(() => lastTo('/reply'));
   // 上一个测试回完还可能晚到一次压缩请求，跳过它
   const msgs = fake.relayCalls.find((c) => !JSON.stringify(c.body.messages).includes('记忆压缩助手')).body.messages;
-  assert.doesNotMatch(msgs[0].content, /节奏/);
-  assert.match(msgs[1].content, /早\n【节奏：慢】$/);
-  assert.match(msgs.at(-1).content, /我想你了\n【节奏：停了3次，删了又打】$/);
+  assert.doesNotMatch(JSON.stringify(msgs), /节奏/);
+  assert.match(msgs[1].content, /早$/);
+  assert.match(msgs.at(-1).content, /我想你了$/);
 });
