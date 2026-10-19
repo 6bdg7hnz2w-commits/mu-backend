@@ -93,7 +93,7 @@ test('CORS 预检放行 Authorization 头', async () => {
 });
 
 test('CORS 默认放行新旧两个前端域名，别的域名不放行', async () => {
-  const preflight = (origin) => fetch(BASE + '/api/typing/ping', {
+  const preflight = (origin) => fetch(BASE + '/api/upload', {
     method: 'OPTIONS',
     headers: { Origin: origin, 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'authorization,content-type' },
   });
