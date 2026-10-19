@@ -1504,7 +1504,7 @@ app.get('/api/cc/usage', requireAppKey, async (req, res) => {
   if (req.query.brief === '1') qs.set('brief', '1');
   for (const k of ['days', 'hours']) if (typeof req.query[k] === 'string' && /^\d{1,3}$/.test(req.query[k])) qs.set(k, req.query[k]);
   try {
-    const r = await fetch(`${bridge.url}/usage?${qs}`, {
+    const r = await fetch(`${bridge.url}/usage${qs.size ? `?${qs}` : ''}`, {
       headers: { 'Authorization': `Bearer ${bridge.token}` },
       signal: AbortSignal.timeout(15000)
     });
