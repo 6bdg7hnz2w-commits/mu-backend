@@ -1482,6 +1482,7 @@ app.get('/api/cc/history', requireAppKey, async (req, res) => {
   if (typeof req.query.before === 'string') qs.set('before', req.query.before);
   if (typeof req.query.limit === 'string') qs.set('limit', req.query.limit);
   if (req.query.system === '1') qs.set('system', '1'); // 新前端要系统事件（"他这次没回上来"）
+  if (req.query.tools === '1') qs.set('tools', '1'); // 还要他调过哪些工具（和 system=1 一起才有）
   try {
     const r = await fetch(`${bridge.url}/history?${qs}`, {
       headers: { 'Authorization': `Bearer ${bridge.token}` },

@@ -153,6 +153,14 @@ test('history：system=1 透传给 bridge，别的值不透传', async () => {
   assert.doesNotMatch(lastHistory(), /system/);
 });
 
+test('history：tools=1 透传给 bridge，别的值不透传', async () => {
+  const lastHistory = () => [...seen].reverse().find((r) => r.url.startsWith('/history')).url;
+  await fetch(`${BASE}/api/cc/history?limit=30&system=1&tools=1`, { headers: AUTH });
+  assert.match(lastHistory(), /[?&]tools=1(&|$)/);
+  await fetch(`${BASE}/api/cc/history?limit=30&system=1&tools=yes`, { headers: AUTH });
+  assert.doesNotMatch(lastHistory(), /tools/);
+});
+
 test('usage：brief/days/hours 透传给 bridge，别的参数和非数字不透传', async () => {
   const lastUsage = () => [...seen].reverse().find((r) => r.url.startsWith('/usage')).url;
   const r = await fetch(`${BASE}/api/cc/usage?brief=1`, { headers: AUTH });
