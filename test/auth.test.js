@@ -92,6 +92,17 @@ test('CORS 预检放行 Authorization 头', async () => {
   assert.match(r.headers.get('access-control-allow-headers') || '', /authorization/i);
 });
 
+test('CORS 默认放行新旧两个前端域名，别的域名不放行', async () => {
+  const preflight = (origin) => fetch(BASE + '/api/typing/ping', {
+    method: 'OPTIONS',
+    headers: { Origin: origin, 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'authorization,content-type' },
+  });
+  for (const origin of ['https://mu0727.com', 'https://mu-frontend.onrender.com']) {
+    assert.equal((await preflight(origin)).headers.get('access-control-allow-origin'), origin);
+  }
+  assert.equal((await preflight('https://evil.example.com')).headers.get('access-control-allow-origin'), null);
+});
+
 test('todos 带口令：增、查、改、删都正常', async () => {
   const created = await (await call('POST', '/api/todos', { headers: AUTH, body: { side: 'her', text: '买牛奶', due_time: '2026-10-09' } })).json();
   assert.equal(created.text, '买牛奶');
