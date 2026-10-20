@@ -1217,17 +1217,18 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
   const bridge = bridgeConfig();
   if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
   const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
-  // images / files 是 /api/cc/upload 返回的 path，原样交给 bridge（bridge 会再校验一遍必须是它存下的文件）
-  const { images, files } = req.body || {};
+  // images / files 是 /api/cc/upload 返回的 path，voices 是 /api/cc/listen 返回的 path，原样交给 bridge（bridge 会再校验一遍必须是它存下的文件）
+  const { images, files, voices } = req.body || {};
   const isPaths = (v) => v === undefined || (Array.isArray(v) && v.every(p => typeof p === 'string'));
-  if (!isPaths(images) || !isPaths(files)) return res.status(400).json({ error: 'images / files must be arrays of paths' });
+  if (!isPaths(images) || !isPaths(files) || !isPaths(voices)) return res.status(400).json({ error: 'images / files / voices must be arrays of paths' });
   const hasImages = Array.isArray(images) && images.length > 0;
   const hasFiles = Array.isArray(files) && files.length > 0;
+  const hasVoices = Array.isArray(voices) && voices.length > 0;
   const maxItems = (await fetchFileTypes(bridge).catch(() => null))?.max_items || CC_MAX_ITEMS_FALLBACK;
-  if ((images?.length || 0) + (files?.length || 0) > maxItems) {
-    return res.status(400).json({ error: `图片和文件一次合计最多 ${maxItems} 个` });
+  if ((images?.length || 0) + (files?.length || 0) + (voices?.length || 0) > maxItems) {
+    return res.status(400).json({ error: `图片、文件和语音一次合计最多 ${maxItems} 个` });
   }
-  if (!text && !hasImages && !hasFiles) return res.status(400).json({ error: 'text required' });
+  if (!text && !hasImages && !hasFiles && !hasVoices) return res.status(400).json({ error: 'text required' });
   const clientId = req.body?.client_id;
   if (clientId !== undefined && !isCcId(clientId)) return res.status(400).json({ error: 'client_id must be 1-64 letters, digits, - or _' });
   const kind = req.body?.kind ?? 'chat';
@@ -1236,7 +1237,7 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
     const r = await fetch(`${bridge.url}/send`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, kind, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}), ...(clientId ? { client_id: clientId } : {}) }),
+      body: JSON.stringify({ text, kind, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}), ...(hasVoices ? { voices } : {}), ...(clientId ? { client_id: clientId } : {}) }),
       signal: AbortSignal.timeout(15000)
     });
     if (!r.ok) {
@@ -1413,6 +1414,40 @@ app.post('/api/cc/upload', requireAppKey, async (req, res) => {
       res.json(image ? { id: data.id, path: data.path } : { id: data.id, path: data.path, name: data.name, size: data.size, mime: data.mime });
     } catch (err) {
       console.error('CC bridge upload error:', err.message);
+      res.status(502).json({ error: 'bridge unreachable' });
+    }
+  });
+});
+
+// 按住说话：multipart，字段 audio（录音）+ duration（前端量的秒数，webm 自己不带时长）。
+// 转成原始字节给 bridge /listen，bridge 交给 VPS 本机的 ears 转写 + 听语气，回 { path, text, emotion, hint, relative, … }
+// 声纹锁认不出是她：bridge 回 422（没转写），原样带给前端
+const CC_VOICE_MAX = 10 * 1024 * 1024;
+const ccVoiceParser = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: CC_VOICE_MAX, files: 1 },
+  fileFilter: (req, file, cb) => cb(file.mimetype.startsWith('audio/') || file.mimetype.startsWith('video/') || file.mimetype === 'application/octet-stream' ? null : new Error('Only audio is allowed'), true),
+}).single('audio');
+app.post('/api/cc/listen', requireAppKey, (req, res) => {
+  const bridge = bridgeConfig();
+  if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+  ccVoiceParser(req, res, async (err) => {
+    if (err) return res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? '语音不能超过 10MB' : err.message });
+    if (!req.file) return res.status(400).json({ error: 'audio required' });
+    const duration = Number(req.body?.duration);
+    const headers = { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': req.file.mimetype || 'application/octet-stream' };
+    if (Number.isFinite(duration) && duration > 0) headers['X-Duration'] = String(Math.min(duration, 600));
+    try {
+      // ears 要转码、算声学特征、过声纹、调两次 Groq：一般几秒，给足
+      const r = await fetch(`${bridge.url}/listen`, { method: 'POST', headers, body: req.file.buffer, signal: AbortSignal.timeout(100000) });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        console.error('CC bridge listen failed:', r.status, data.error || '');
+        return res.status([400, 413, 415, 422].includes(r.status) ? r.status : 502).json({ error: data.error || `bridge ${r.status}`, ...(data.locked ? { locked: true } : {}) });
+      }
+      res.json(data);
+    } catch (e) {
+      console.error('CC bridge listen error:', e.message);
       res.status(502).json({ error: 'bridge unreachable' });
     }
   });

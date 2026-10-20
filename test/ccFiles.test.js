@@ -41,6 +41,11 @@ before(async () => {
         return send(200, name ? { id: 'f1', path: '/var/lib/mu-bridge/uploads/2026-10-09/f1-x.pdf', name, size: body.length, mime: 'application/pdf' } : { id: 'i1', path: '/var/lib/mu-bridge/uploads/2026-10-09/i1.jpg' });
       }
       if (req.url === '/send') return send(200, { ok: true, id: 'm1', time: '2026-10-09T10:00:00+08:00' });
+      if (req.url === '/listen') {
+        if (body.toString('latin1').includes('STRANGER')) return send(422, { error: '没认出是你的声音，这段没转写', locked: true });
+        if (body.toString('latin1').includes('BOOM')) return send(500, { error: 'internal' });
+        return send(200, { id: 'v1', path: '/var/lib/mu-bridge/uploads/2026-10-20/v1.webm', text: '我没事', emotion: '委屈', hint: '像是强撑', relative: { 音量: '比较偏低' }, duration: 3.2 });
+      }
       if (req.url.startsWith('/uploads/')) {
         res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Disposition': "inline; filename=\"__.pdf\"; filename*=UTF-8''%E5%91%A8%E6%8A%A5.pdf" });
         return res.end('%PDF-1.4');
@@ -187,4 +192,52 @@ test('uploads 回显：带回类型和原文件名', async () => {
   assert.equal(r.status, 200);
   assert.equal(r.headers.get('content-type'), 'application/pdf');
   assert.match(r.headers.get('content-disposition'), /filename\*=UTF-8''%E5%91%A8%E6%8A%A5\.pdf/);
+});
+
+// 按住说话：录音转给 bridge /listen（原始字节 + 类型 + 时长），结果原样回；声纹锁的 422 带回去
+const listen = (content, type, duration) => {
+  const f = new FormData();
+  if (duration !== undefined) f.append('duration', duration);
+  f.append('audio', new Blob([content], { type }), 'voice.webm');
+  return fetch(`${BASE}/api/cc/listen`, { method: 'POST', headers: AUTH, body: f });
+};
+
+test('语音：字段 audio 转成原始字节给 bridge /listen，带 X-Duration，结果原样回', async () => {
+  const r = await listen(Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 1, 2]), 'audio/webm;codecs=opus', '3.24');
+  assert.equal(r.status, 200);
+  const d = await r.json();
+  assert.equal(d.text, '我没事');
+  assert.equal(d.path, '/var/lib/mu-bridge/uploads/2026-10-20/v1.webm');
+  const req = lastTo('/listen');
+  assert.equal(req.headers.authorization, 'Bearer bridge-test-token');
+  assert.equal(req.headers['content-type'], 'audio/webm'); // multer 去掉了 ;codecs=…，bridge 只看文件头
+  assert.equal(req.headers['x-duration'], '3.24');
+  assert.deepEqual([...req.body], [0x1a, 0x45, 0xdf, 0xa3, 1, 2]);
+});
+
+test('语音：iPhone 的 audio/mp4 也收；没带时长就不带 X-Duration', async () => {
+  const r = await listen('....ftypM4A rest', 'audio/mp4');
+  assert.equal(r.status, 200);
+  assert.equal(lastTo('/listen').headers['x-duration'], undefined);
+});
+
+test('语音：声纹锁拦下 → 422 带 locked；bridge 别的错 → 502；不是音频 → 400；没口令 → 401', async () => {
+  let r = await listen('STRANGER', 'audio/webm');
+  assert.equal(r.status, 422);
+  assert.deepEqual(await r.json(), { error: '没认出是你的声音，这段没转写', locked: true });
+  r = await listen('BOOM', 'audio/webm');
+  assert.equal(r.status, 502);
+  r = await listen('hello', 'text/plain');
+  assert.equal(r.status, 400);
+  r = await fetch(`${BASE}/api/cc/listen`, { method: 'POST', body: new FormData() });
+  assert.equal(r.status, 401);
+});
+
+test('/api/cc/send 带 voices：原样转给 bridge；不是路径数组 → 400', async () => {
+  const send = (body) => fetch(`${BASE}/api/cc/send`, { method: 'POST', headers: { ...AUTH, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  let r = await send({ text: '', voices: ['/var/lib/mu-bridge/uploads/2026-10-20/v1.webm'], client_id: 'c-v1' });
+  assert.equal(r.status, 200);
+  assert.deepEqual(JSON.parse(lastTo('/send').body).voices, ['/var/lib/mu-bridge/uploads/2026-10-20/v1.webm']);
+  r = await send({ text: '', voices: 'x' });
+  assert.equal(r.status, 400);
 });
