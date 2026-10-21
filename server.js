@@ -7,6 +7,7 @@ const multer = require('multer');
 const { fetchFileTypes, checkFile } = require('./lib/ccFiles');
 const { findOption, publicCatalog, keyEnvName } = require('./lib/apiModels');
 const { makeApiTurns } = require('./lib/apiTurn');
+const { makeCcOcr } = require('./lib/ccOcr');
 const crypto = require('node:crypto');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
@@ -1204,6 +1205,9 @@ function bridgeConfig() {
 
 // 切到 API 时替沐回消息的那一套（lib/apiTurn.js）；/send、/retry 看到 bridge 回 brain:"api" 就交给它
 const apiTurns = makeApiTurns({ bridgeConfig, supabase, voiceRule: VOICE_RULE, formatTime: formatChatTimestamp, estimateTokens, onReply: tagMood });
+// 她发的图交给 deepseek-flash 认字，写回 bridge 供查找聊天记录（lib/ccOcr.js）
+const ccOcr = makeCcOcr({ bridgeFetch: apiTurns.bridgeFetch });
+if (bridgeConfig()) ccOcr.start();
 
 // 图片 + 文件一次最多几个看白名单里的 max_items；白名单拉不到时按 9 算（bridge 那边还会再卡一次）
 const CC_MAX_ITEMS_FALLBACK = 9;
@@ -1249,6 +1253,7 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
     const brain = data.brain === 'api' || data.brain === 'cc' ? data.brain : undefined;
     res.json({ ok: true, id: data.id, time: data.time, ...(Number.isSafeInteger(data.seq) ? { seq: data.seq } : {}), ...(brain ? { brain } : {}) });
     if (brain === 'api') apiTurns.enqueue(data.id);
+    if (hasImages) ccOcr.kick();
   } catch (err) {
     console.error('CC bridge send error:', err.message);
     res.status(502).json({ error: 'bridge unreachable' });
@@ -1500,6 +1505,9 @@ app.get('/api/cc/history', requireAppKey, async (req, res) => {
   if (typeof req.query.limit === 'string') qs.set('limit', req.query.limit);
   if (req.query.system === '1') qs.set('system', '1'); // 新前端要系统事件（"他这次没回上来"）
   if (req.query.tools === '1') qs.set('tools', '1'); // 还要他调过哪些工具（和 system=1 一起才有）
+  // 查找聊天记录点进来：around=那条的 id（前后各一半）；往下翻：after=手上最晚那条的时间
+  if (isCcId(req.query.around)) qs.set('around', req.query.around);
+  if (typeof req.query.after === 'string') qs.set('after', req.query.after);
   try {
     const r = await fetch(`${bridge.url}/history?${qs}`, {
       headers: { 'Authorization': `Bearer ${bridge.token}` },
@@ -1513,6 +1521,32 @@ app.get('/api/cc/history', requireAppKey, async (req, res) => {
     res.status(502).json({ error: 'bridge unreachable' });
   }
 });
+
+// 查找聊天记录：bridge 把双方的话、语音转写、文件名、图片里的字全读一遍比对，从新到旧
+app.get('/api/cc/search', requireAppKey, async (req, res) => {
+  const bridge = bridgeConfig();
+  if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  if (!q || q.length > 100) return res.status(400).json({ error: 'q 要是 1–100 个字' });
+  const qs = new URLSearchParams({ q });
+  if (typeof req.query.before === 'string') qs.set('before', req.query.before);
+  if (typeof req.query.limit === 'string' && /^\d{1,3}$/.test(req.query.limit)) qs.set('limit', req.query.limit);
+  try {
+    const r = await fetch(`${bridge.url}/search?${qs}`, {
+      headers: { 'Authorization': `Bearer ${bridge.token}` },
+      signal: AbortSignal.timeout(15000)
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(r.status === 400 ? 400 : 502).json({ error: data.error || `bridge ${r.status}` });
+    res.json(data);
+  } catch (err) {
+    console.error('CC bridge search error:', err.message);
+    res.status(502).json({ error: 'bridge unreachable' });
+  }
+});
+
+// 图片认字的进度（配没配 key、认了几张、还剩几张、最近一次出错）
+app.get('/api/cc/ocr/status', requireAppKey, (req, res) => res.json(ccOcr.status()));
 
 // 额度消耗：聊天页只要 brief=1（上下文多大、额度几点恢复），Usage 页要按天、按小时的统计。只透传这三个参数，而且只收数字
 app.get('/api/cc/usage', requireAppKey, async (req, res) => {

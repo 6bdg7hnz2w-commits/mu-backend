@@ -49,7 +49,7 @@ const PROTECTED = [
   ['POST', '/api/nook/annotations/1/floors', {}], ['PUT', '/api/nook/floors/1', {}], ['DELETE', '/api/nook/floors/1'], ['DELETE', '/api/nook/annotations/1'],
   ['POST', '/api/nook/books/1/chapters/1/ai-annotate'],
   ['POST', '/api/cc/send', { text: 'x' }], ['POST', '/api/cc/upload'], ['GET', '/api/cc/file-types'], ['GET', '/api/cc/uploads/2026-10-09/x.pdf'], ['GET', '/api/cc/history'],
-  ['POST', '/api/cc/edit', { id: 'm1', text: 'x' }], ['POST', '/api/cc/retry', { id: 'm1' }], ['GET', '/api/cc/history?system=1'],
+  ['POST', '/api/cc/edit', { id: 'm1', text: 'x' }], ['POST', '/api/cc/retry', { id: 'm1' }], ['GET', '/api/cc/history?system=1'], ['GET', '/api/cc/search?q=x'], ['GET', '/api/cc/ocr/status'],
   ['GET', '/api/cc/api-models'], ['GET', '/api/cc/brain'], ['POST', '/api/cc/brain', { target: 'cc' }],
   ['POST', '/api/cc/api-test', { model: '[K]claude-opus-4-6', group: 'default' }],
 ];

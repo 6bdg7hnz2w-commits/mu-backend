@@ -28,6 +28,7 @@ before(async () => {
       if (req.url === '/file-types') return send(200, { max_bytes: 1024, max_items: 9, types: [] });
       if (req.url === '/send') return send(200, { ok: true, id: 'm1', time: '2026-10-10T10:00:00+08:00' });
       if (req.url.startsWith('/history')) return send(200, { messages: [], has_more: false });
+      if (req.url.startsWith('/search')) return send(200, { terms: ['x'], results: [], has_more: false });
       if (req.url.startsWith('/usage')) return send(200, { context_tokens: 88000, days: [], hours: [] });
       if (req.url === '/edit') {
         if (body.id === 'missing') return send(404, { error: '找不到这条消息' });
@@ -159,6 +160,31 @@ test('history：tools=1 透传给 bridge，别的值不透传', async () => {
   assert.match(lastHistory(), /[?&]tools=1(&|$)/);
   await fetch(`${BASE}/api/cc/history?limit=30&system=1&tools=yes`, { headers: AUTH });
   assert.doesNotMatch(lastHistory(), /tools/);
+});
+
+test('history：around（合法 id）、after 透传给 bridge', async () => {
+  const lastHistory = () => [...seen].reverse().find((r) => r.url.startsWith('/history')).url;
+  await fetch(`${BASE}/api/cc/history?around=o-abc123&limit=60`, { headers: AUTH });
+  assert.match(lastHistory(), /[?&]around=o-abc123(&|$)/);
+  await fetch(`${BASE}/api/cc/history?around=${encodeURIComponent('../x')}`, { headers: AUTH });
+  assert.doesNotMatch(lastHistory(), /around/);
+  await fetch(`${BASE}/api/cc/history?after=${encodeURIComponent('2026-10-20T10:00:00+08:00')}`, { headers: AUTH });
+  assert.match(lastHistory(), /[?&]after=2026-10-20T10%3A00%3A00%2B08%3A00(&|$)/);
+});
+
+test('search：q 去掉两头空白透传，before/limit 透传；空的、太长的 400 不打 bridge', async () => {
+  const lastSearch = () => [...seen].reverse().find((r) => r.url.startsWith('/search'))?.url;
+  const r = await fetch(`${BASE}/api/cc/search?q=${encodeURIComponent(' 借书证 雨伞 ')}&before=2026-10-20T10%3A00%3A00%2B08%3A00&limit=30&x=1`, { headers: AUTH });
+  assert.equal(r.status, 200);
+  const qs = new URLSearchParams(lastSearch().split('?')[1]);
+  assert.equal(qs.get('q'), '借书证 雨伞');
+  assert.equal(qs.get('before'), '2026-10-20T10:00:00+08:00');
+  assert.equal(qs.get('limit'), '30');
+  assert.equal(qs.get('x'), null);
+  const n = seen.length;
+  assert.equal((await fetch(`${BASE}/api/cc/search?q=%20`, { headers: AUTH })).status, 400);
+  assert.equal((await fetch(`${BASE}/api/cc/search?q=${'字'.repeat(101)}`, { headers: AUTH })).status, 400);
+  assert.equal(seen.length, n);
 });
 
 test('usage：brief/days/hours 透传给 bridge，别的参数和非数字不透传', async () => {
