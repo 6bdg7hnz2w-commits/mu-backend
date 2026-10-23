@@ -1545,6 +1545,44 @@ app.get('/api/cc/uploads/:date/:file', requireAppKey, async (req, res) => {
   }
 });
 
+// 沐的记忆和相册（App 的 Memory / Album 页，只读）：原样转 bridge 的 /memory、/album、/album/:file
+app.get(['/api/cc/memory', '/api/cc/album'], requireAppKey, async (req, res) => {
+  const bridge = bridgeConfig();
+  if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+  try {
+    const r = await fetch(`${bridge.url}${req.path.replace('/api/cc', '')}`, {
+      headers: { 'Authorization': `Bearer ${bridge.token}` },
+      signal: AbortSignal.timeout(15000)
+    });
+    if (!r.ok) return res.status(502).json({ error: `bridge ${r.status}` });
+    res.set('Cache-Control', 'no-store').json(await r.json());
+  } catch (err) {
+    console.error('CC bridge memory/album error:', err.message);
+    res.status(502).json({ error: 'bridge unreachable' });
+  }
+});
+
+app.get('/api/cc/album/:file', requireAppKey, async (req, res) => {
+  const bridge = bridgeConfig();
+  if (!bridge) return res.status(500).json({ error: 'bridge not configured' });
+  // ?thumb=1：网格里用的宽 720 缩略图（bridge 做不出来时回原图）
+  const qs = req.query.thumb === '1' ? '?thumb=1' : '';
+  try {
+    const r = await fetch(`${bridge.url}/album/${encodeURIComponent(req.params.file)}${qs}`, {
+      headers: { 'Authorization': `Bearer ${bridge.token}` },
+      signal: AbortSignal.timeout(30000)
+    });
+    if (!r.ok) return res.status(r.status === 404 ? 404 : 502).json({ error: `bridge ${r.status}` });
+    res.set({ 'Content-Type': r.headers.get('content-type') || 'application/octet-stream', 'Cache-Control': r.headers.get('cache-control') || 'private, max-age=86400', 'X-Content-Type-Options': 'nosniff' });
+    const len = r.headers.get('content-length'); if (len) res.set('content-length', len);
+    await pipeline(Readable.fromWeb(r.body), res);
+  } catch (err) {
+    console.error('CC bridge album error:', err.message);
+    if (!res.headersSent) res.status(502).json({ error: 'bridge unreachable' });
+    else res.destroy();
+  }
+});
+
 // 聊天记录：bridge 把 inbox（桦桦）和 outbox（沐）合并后按时间返回
 app.get('/api/cc/history', requireAppKey, async (req, res) => {
   const bridge = bridgeConfig();
