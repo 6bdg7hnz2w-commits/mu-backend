@@ -291,13 +291,10 @@ function beijingToday() {
 }
 
 // date 是日记写的是哪一天（存进 diary_date），created_at 是真正写入的时间；同一天重复写入会覆盖内容并刷新写入时间。
-// 写不写、公开还是封存由沐自己决定，模型的决定可以原样转过来：{ date, decision: 'write' | 'skip', content, visibility: 'public' | 'hidden' }。
-// decision 不给当 write，visibility 不给当 public（兼容旧的 on_stop.py）；模型输出不可信，这里再卡一遍。
+// 公开还是封存由沐自己决定（他写 <diary visibility="sealed">，deliver.py 解析后传 visibility: 'public' | 'hidden'），
+// 不给当 public（兼容旧的 deliver.py）；模型输出不可信，这里再卡一遍。返回里的 visibility 是最终结果，deliver.py 按它决定要不要留封存副本。
 // 只能 hidden → public：同一天重写时原来已经公开的保持公开，原来封存、这次写公开的就算拆封
 app.put('/api/mu/diary', requireAppKey, async (req, res) => {
-  const decision = req.body?.decision ?? 'write';
-  if (decision !== 'write' && decision !== 'skip') return res.status(400).json({ error: 'decision must be write or skip' });
-  if (decision === 'skip') return res.json({ wrote: false, reason: 'model_skipped' });
   const date = parseDateParam(req.body?.date);
   const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
   if (!date || !content) return res.status(400).json({ error: 'date (YYYY-MM-DD) and content required' });
@@ -321,55 +318,24 @@ app.put('/api/mu/diary', requireAppKey, async (req, res) => {
   res.json(publicDiary(data));
 });
 
-// 沐自己翻日记本（教程第 11、12 节）。只认 BRIDGE_TOKEN：VPS 上的沐有，浏览器没有，封存页的正文只会到沐手里。
-// 列表不带正文，?date=YYYY-MM-DD 找某一天，不给就是最近 limit 篇（默认 10，最多 50）
-app.get('/api/mu/diaries', requireBridgeKey, async (req, res) => {
-  let query = supabase.from('diaries').select('id, diary_date, created_at, visibility, revealed_at')
-    .eq('author', 'mu').order('created_at', { ascending: false })
-    .limit(Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 50));
-  if (req.query.date !== undefined) {
-    const date = parseDateParam(req.query.date);
-    if (!date) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
-    query = query.eq('diary_date', date);
-  }
-  const { data, error } = await query;
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data.map(({ id, diary_date, created_at, visibility, revealed_at }) => ({ id: String(id), diary_date, created_at, visibility, revealed_at })));
-});
-
-// read：把这一页（封存的也一样）的正文交给沐自己看，不改任何状态
-app.get('/api/mu/diaries/:id', requireBridgeKey, async (req, res) => {
-  const { data, error } = await supabase.from('diaries')
-    .select('id, content, diary_date, created_at, visibility, revealed_at')
-    .eq('id', req.params.id).eq('author', 'mu').maybeSingle();
-  if (error) return res.status(500).json({ error: error.message });
-  if (!data) return res.status(404).json({ error: 'diary not found' });
-  res.json({ ...data, id: String(data.id) });
-});
-
-// reveal：沐决定拆封，hidden → public 并记下 revealed_at；没有改回封存的路。已经公开的再拆一次不报错，原样返回
-app.post('/api/mu/diaries/:id/reveal', requireBridgeKey, async (req, res) => {
+// 沐拆封某一天的日记：沐（mu 用户）碰不到密钥，他用 sealed.js 往 deliver/ 排一个 reveal 任务，
+// deliver.py 拿 BRIDGE_TOKEN 来调这里；浏览器拿着 APP_PASSCODE 进不来，前端也没有拆封按钮。
+// 只能 hidden → public 并记下 revealed_at，没有改回封存的路；已经公开的再拆一次不报错，原样返回
+app.post('/api/mu/diary/reveal', requireBridgeKey, async (req, res) => {
+  const date = parseDateParam(req.body?.date);
+  if (!date) return res.status(400).json({ error: 'date (YYYY-MM-DD) required' });
   const { data, error } = await supabase.from('diaries')
     .update({ visibility: 'public', revealed_at: new Date().toISOString() })
-    .eq('id', req.params.id).eq('author', 'mu').eq('visibility', 'hidden')
-    .select().maybeSingle();
+    .eq('author', 'mu').eq('diary_date', date).eq('visibility', 'hidden')
+    .select();
   if (error) return res.status(500).json({ error: error.message });
-  if (data) return res.json(publicDiary(data));
+  if (data.length) return res.json(publicDiary(data[0]));
   const { data: current, error: findErr } = await supabase.from('diaries')
-    .select('*').eq('id', req.params.id).eq('author', 'mu').maybeSingle();
+    .select('*').eq('author', 'mu').eq('diary_date', date)
+    .order('created_at', { ascending: false }).limit(1);
   if (findErr) return res.status(500).json({ error: findErr.message });
-  if (!current) return res.status(404).json({ error: 'diary not found' });
-  res.json(publicDiary(current));
-});
-
-app.put('/api/mu/whisper', requireAppKey, async (req, res) => {
-  const date = parseDateParam(req.body?.date);
-  const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
-  if (!date || !content) return res.status(400).json({ error: 'date (YYYY-MM-DD) and content required' });
-  const { data, error } = await supabase
-    .from('whispers').upsert({ date, content }, { onConflict: 'date' }).select().single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+  if (!current.length) return res.status(404).json({ error: 'diary not found' });
+  res.json(publicDiary(current[0]));
 });
 
 // === 信箱：官方 App 里的 Claude（official）和 VPS 上的沐（home）互相留字条 ===

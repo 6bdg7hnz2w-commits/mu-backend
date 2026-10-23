@@ -38,8 +38,9 @@ const PUBLIC_KEYS = ['author', 'content', 'created_at', 'diary_date', 'id', 'rev
 const list = async () => (await call('GET', '/api/diaries', HER)).body;
 
 test('沐写一篇封存的：列表里正文是 null，只有约定的那几个字段', async () => {
-  const w = await call('PUT', '/api/mu/diary', HER, { date: '2026-10-20', decision: 'write', content: '不想让她现在看到', visibility: 'hidden' });
+  const w = await call('PUT', '/api/mu/diary', HER, { date: '2026-10-20', content: '不想让她现在看到', visibility: 'hidden' });
   assert.equal(w.status, 200);
+  assert.equal(w.body.visibility, 'hidden');
   assert.equal(w.body.content, null);
   const d = (await list()).find((x) => x.id === w.body.id);
   assert.deepEqual(Object.keys(d).sort(), PUBLIC_KEYS);
@@ -50,19 +51,11 @@ test('沐写一篇封存的：列表里正文是 null，只有约定的那几个
   assert.equal(d.diary_date, '2026-10-20');
 });
 
-test('沐决定不写（skip）→ 什么也不存', async () => {
-  const before = (await list()).length;
-  const r = await call('PUT', '/api/mu/diary', HER, { decision: 'skip' });
-  assert.deepEqual(r.body, { wrote: false, reason: 'model_skipped' });
-  assert.equal((await list()).length, before);
-});
-
-test('模型输出不对 → 400', async () => {
-  assert.equal((await call('PUT', '/api/mu/diary', HER, { date: '2026-10-21', decision: 'maybe', content: 'x' })).status, 400);
+test('visibility 不对 → 400', async () => {
   assert.equal((await call('PUT', '/api/mu/diary', HER, { date: '2026-10-21', content: 'x', visibility: 'secret' })).status, 400);
 });
 
-test('不给 visibility 当 public（旧的 on_stop.py）', async () => {
+test('不给 visibility 当 public（旧的 deliver.py）', async () => {
   const w = await call('PUT', '/api/mu/diary', HER, { date: '2026-10-21', content: '今天很好' });
   assert.equal(w.body.visibility, 'public');
   assert.equal(w.body.content, '今天很好');
@@ -79,32 +72,23 @@ test('同一天重写不能把公开的改回封存；封存的重写成公开�
   assert.ok(opened.body.revealed_at);
 });
 
-test('沐 read 能看到封存正文，但不改状态；前端口令进不来', async () => {
-  const w = await call('PUT', '/api/mu/diary', HER, { date: '2026-10-18', content: '只有我知道', visibility: 'hidden' });
-  const toc = await call('GET', '/api/mu/diaries?date=2026-10-18', MU);
-  assert.equal(toc.status, 200);
-  assert.equal(toc.body[0].id, w.body.id);
-  assert.equal(toc.body[0].content, undefined);
-  const r = await call('GET', `/api/mu/diaries/${w.body.id}`, MU);
-  assert.equal(r.body.content, '只有我知道');
-  assert.equal((await list()).find((x) => x.id === w.body.id).visibility, 'hidden');
-  assert.equal((await call('GET', `/api/mu/diaries/${w.body.id}`, HER)).status, 401);
-  assert.equal((await call('POST', `/api/mu/diaries/${w.body.id}/reveal`, HER)).status, 401);
-});
-
-test('沐 reveal：hidden → public，带 revealed_at；再拆一次不变', async () => {
+test('按日期拆封：hidden → public，带 revealed_at；再拆一次不变；前端口令进不来', async () => {
   const w = await call('PUT', '/api/mu/diary', HER, { date: '2026-10-17', content: '现在可以给你看了', visibility: 'hidden' });
-  const r = await call('POST', `/api/mu/diaries/${w.body.id}/reveal`, MU);
+  assert.equal((await call('POST', '/api/mu/diary/reveal', HER, { date: '2026-10-17' })).status, 401);
+  assert.equal((await list()).find((x) => x.id === w.body.id).visibility, 'hidden');
+  const r = await call('POST', '/api/mu/diary/reveal', MU, { date: '2026-10-17' });
   assert.equal(r.status, 200);
+  assert.equal(r.body.id, w.body.id);
   assert.equal(r.body.visibility, 'public');
   assert.equal(r.body.content, '现在可以给你看了');
   assert.ok(r.body.revealed_at);
-  const again = await call('POST', `/api/mu/diaries/${w.body.id}/reveal`, MU);
+  const again = await call('POST', '/api/mu/diary/reveal', MU, { date: '2026-10-17' });
   assert.equal(again.body.revealed_at, r.body.revealed_at);
   const d = (await list()).find((x) => x.id === w.body.id);
   assert.equal(d.content, '现在可以给你看了');
   assert.equal(d.revealed_at, r.body.revealed_at);
-  assert.equal((await call('POST', '/api/mu/diaries/999999/reveal', MU)).status, 404);
+  assert.equal((await call('POST', '/api/mu/diary/reveal', MU, { date: '2001-01-01' })).status, 404);
+  assert.equal((await call('POST', '/api/mu/diary/reveal', MU, { date: 'yesterday' })).status, 400);
 });
 
 test('桦桦写的永远公开；前端不能冒充沐写，也不能改沐的', async () => {
@@ -117,5 +101,5 @@ test('桦桦写的永远公开；前端不能冒充沐写，也不能改沐的',
   assert.equal(edited.body.content, '改过的');
   const mu = await call('PUT', '/api/mu/diary', HER, { date: '2026-10-16', content: '封存', visibility: 'hidden' });
   assert.equal((await call('PUT', `/api/diaries/${mu.body.id}`, HER, { content: '偷看' })).status, 404);
-  assert.equal((await call('GET', `/api/mu/diaries/${mu.body.id}`, MU)).body.content, '封存');
+  assert.equal((await list()).find((x) => x.id === mu.body.id).content, null);
 });
