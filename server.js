@@ -318,6 +318,17 @@ app.put('/api/mu/diary', requireAppKey, async (req, res) => {
   res.json(publicDiary(data));
 });
 
+// 每日一句：deliver.py 解析沐写的 <whisper>，按日期写进来，同一天再写就覆盖
+app.put('/api/mu/whisper', requireAppKey, async (req, res) => {
+  const date = parseDateParam(req.body?.date);
+  const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+  if (!date || !content) return res.status(400).json({ error: 'date (YYYY-MM-DD) and content required' });
+  const { data, error } = await supabase
+    .from('whispers').upsert({ date, content }, { onConflict: 'date' }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
 // 沐拆封某一天的日记：沐（mu 用户）碰不到密钥，他用 sealed.js 往 deliver/ 排一个 reveal 任务，
 // deliver.py 拿 BRIDGE_TOKEN 来调这里；浏览器拿着 APP_PASSCODE 进不来，前端也没有拆封按钮。
 // 只能 hidden → public 并记下 revealed_at，没有改回封存的路；已经公开的再拆一次不报错，原样返回
