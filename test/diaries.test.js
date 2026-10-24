@@ -103,3 +103,13 @@ test('桦桦写的永远公开；前端不能冒充沐写，也不能改沐的',
   assert.equal((await call('PUT', `/api/diaries/${mu.body.id}`, HER, { content: '偷看' })).status, 404);
   assert.equal((await list()).find((x) => x.id === mu.body.id).content, null);
 });
+
+test('每日一句：deliver.py 用 PUT /api/mu/whisper 写进来，同一天再写覆盖，首页拿得到', async () => {
+  assert.equal((await call('PUT', '/api/mu/whisper', HER, { date: '2026-10-24', content: '第一版' })).status, 200);
+  const r = await call('PUT', '/api/mu/whisper', HER, { date: '2026-10-24', content: ' 你等一等我 ' });
+  assert.equal(r.status, 200);
+  assert.deepEqual([r.body.date, r.body.content], ['2026-10-24', '你等一等我']);
+  assert.equal((await call('GET', '/api/whispers/today', HER)).body.content, '你等一等我');
+  assert.equal((await call('PUT', '/api/mu/whisper', HER, { date: '10/24', content: 'x' })).status, 400);
+  assert.equal((await call('PUT', '/api/mu/whisper', {}, { date: '2026-10-24', content: 'x' })).status, 401);
+});

@@ -9,6 +9,7 @@ function builder(table) {
   const st = { op: 'select', filters: [], payload: null };
   const match = (r) => st.filters.every(([k, v]) => String(r[k]) === String(v));
   const run = () => {
+    if (st.op === 'upsert') { const old = rows.find((r) => r[st.key] === st.payload[st.key]); if (old) { Object.assign(old, st.payload); return { data: [old], error: null }; } st.op = 'insert'; }
     if (st.op === 'insert') { const r = { id: nextId++, created_at: new Date().toISOString(), ...st.payload }; rows.push(r); return { data: [r], error: null }; }
     const hit = rows.filter(match);
     if (st.op === 'update') { hit.forEach((r) => Object.assign(r, st.payload)); return { data: hit, error: null }; }
@@ -19,6 +20,7 @@ function builder(table) {
     select: () => b, order: () => b, limit: () => b, range: () => b, neq: () => b, lt: () => b, lte: () => b, gte: () => b, or: () => b, is: () => b, in: () => b,
     eq: (k, v) => { st.filters.push([k, v]); return b; },
     insert: (p) => { st.op = 'insert'; st.payload = p; return b; },
+    upsert: (p, o) => { st.op = 'upsert'; st.payload = p; st.key = o?.onConflict; return b; },
     update: (p) => { st.op = 'update'; st.payload = p; return b; },
     delete: () => { st.op = 'delete'; return b; },
     single: () => { const r = run(); return Promise.resolve({ data: r.data[0] ?? null, error: r.data.length ? null : { code: 'PGRST116', message: 'no rows' } }); },
