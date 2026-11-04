@@ -379,7 +379,18 @@ app.post('/api/letters', requireAppKey, async (req, res) => {
   const { data, error } = await supabase.from('letters').insert({ author, content, kind }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.status(201).json(data);
+  // 官方那边写来的：马上叫 bridge 去收（它排一个收信任务给 deliver.py），不用等 mu-letters.timer 的 30 分钟。
+  // 叫不到也不要紧，timer 照旧会收；不等它回，也不影响上面已经回给写信那边的 201
+  if (author === 'official') pokeBridgeLetters();
 });
+
+function pokeBridgeLetters() {
+  const bridge = bridgeConfig();
+  if (!bridge) return;
+  fetch(`${bridge.url}/letters/poke`, { method: 'POST', headers: { 'Authorization': `Bearer ${bridge.token}` }, signal: AbortSignal.timeout(10000) })
+    .then(r => { if (!r.ok) console.error('bridge /letters/poke failed:', r.status) })
+    .catch(err => console.error('bridge /letters/poke error:', err.message));
+}
 
 app.post('/api/letters/:id/read', requireAppKey, async (req, res) => {
   if (!/^\d+$/.test(req.params.id)) return res.status(400).json({ error: 'invalid id' });
@@ -1297,11 +1308,16 @@ app.post('/api/cc/send', requireAppKey, async (req, res) => {
   if (clientId !== undefined && !isCcId(clientId)) return res.status(400).json({ error: 'client_id must be 1-64 letters, digits, - or _' });
   const kind = req.body?.kind ?? 'chat';
   if (!CC_KINDS.has(kind)) return res.status(400).json({ error: `kind must be one of ${[...CC_KINDS].join(', ')}` });
+  // 前端给每条的自增序号和本地发送时间：只卡类型，原样交给 bridge 记下（前端一次只发一条、收到确认才发下一条）
+  const clientSeq = req.body?.client_seq;
+  if (clientSeq !== undefined && !(Number.isSafeInteger(clientSeq) && clientSeq > 0)) return res.status(400).json({ error: 'client_seq must be a positive integer' });
+  const clientTime = req.body?.client_time;
+  if (clientTime !== undefined && !(typeof clientTime === 'string' && clientTime.length <= 40 && !Number.isNaN(Date.parse(clientTime)))) return res.status(400).json({ error: 'client_time must be an ISO time' });
   try {
     const r = await fetch(`${bridge.url}/send`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${bridge.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, kind, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}), ...(hasVoices ? { voices } : {}), ...(clientId ? { client_id: clientId } : {}) }),
+      body: JSON.stringify({ text, kind, ...(hasImages ? { images } : {}), ...(hasFiles ? { files } : {}), ...(hasVoices ? { voices } : {}), ...(clientId ? { client_id: clientId } : {}), ...(clientSeq !== undefined ? { client_seq: clientSeq } : {}), ...(clientTime !== undefined ? { client_time: clientTime } : {}) }),
       signal: AbortSignal.timeout(15000)
     });
     if (!r.ok) {
