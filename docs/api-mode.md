@@ -175,3 +175,12 @@ API 模式下后端在回完前端之后自己排一轮 API，前端照常等 SS
 规则：分组名转大写、非字母数字换成 `_`，前面加 `RELAY_KEY_`；没配就用 `RELAY_API_KEY`。
 
 可选：`API_TURN_DEBOUNCE_MS`（默认 2500）、`API_TURN_TIMEOUT_MS`（默认 180000）。
+
+## 记忆包接班（lib/apiTurn.js、lib/ccDays.js）
+
+- system：bridge `GET /pack` 有就用记忆包 + `API_NOTE` + `PACK_NOTE`，前缀两次生成之间不变，带 `cache_control`（中转回 400 就记住、退回字符串）；没有就走上面的老拼法。封存日记两条路都不给。
+- 她最后一条后面挂 `GET /turn-context` 的【现在】：胶囊、身体、钉子、今天的格子。会话摘要放在第一条最前。
+- 上文取 200 条。超 token 阈值或满 120 条就把旧的压成摘要，留最近 60 条原文；同一次切换里满 3 层或最早一层满 24 小时，从原始聊天重新生成（`metadata.rebuilt`）。
+- 上游拦内容（503 违规）：去掉 `intimacy-talk.md` 那一节再试一次。
+- `<pin>` 和 `[[…]]` 由 bridge 的 `/reply` 执行并摘掉，回来的 `text` 才是她看到的。
+- bridge 叫的接口（`BRIDGE_TOKEN`）：`POST /api/cc/takeover {ids}`、`POST /api/cc/days/kick`、`GET /api/mu/diary/recent?days=3`（只给公开的）。
