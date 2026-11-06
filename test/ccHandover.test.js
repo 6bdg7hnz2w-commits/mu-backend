@@ -113,17 +113,29 @@ async function ask(f, turns, n, text) {
 
 test('记忆包当 system 前缀：带 cache_control，两轮之间一字不变；会变的挂在她最后一条后面', async () => {
   await setup(async (f, turns) => {
-    f.ctx = { capsule: '她在：洗澡·已过 3 分钟/预计 25', health: null, pins: ['她不吃香菜'], today: [{ key: '午饭', value: '牛肉面' }] };
+    f.ctx = { pins: ['她不吃香菜'] };
     await ask(f, turns, 1, '一');
-    f.ctx = { ...f.ctx, capsule: '她在：洗澡·已过 8 分钟/预计 25' };
+    f.ctx = { pins: ['她不吃香菜', '她说不是护照'] };
     await ask(f, turns, 3, '二');
     const [a, b] = chatCalls(f);
     assert.equal(a.body.messages[0].content[0].cache_control.type, 'ephemeral');
     assert.ok(systemText(a).startsWith(PACK));
     assert.equal(systemText(a), systemText(b));
-    assert.doesNotMatch(systemText(b), /洗澡/);
+    assert.doesNotMatch(systemText(b), /她不吃香菜/);
     const last = b.body.messages[b.body.messages.length - 1].content;
-    assert.match(last, /【现在】\n她在：洗澡·已过 8 分钟\/预计 25\n钉住的事：\n- 她不吃香菜\n今天记下的：午饭：牛肉面$/);
+    assert.match(last, /【现在】\n钉住的事：\n- 她不吃香菜\n- 她说不是护照$/);
+  });
+});
+
+test('别的 400（比如不收图）不关缓存：cache_control 还带着', async () => {
+  await setup(async (f, turns) => {
+    f.relayQueue.push({ status: 400, message: 'image not supported' });
+    turns.enqueue(f.say(1, 'user', '一').id);
+    await waitFor(() => chatCalls(f).length >= 1);
+    await sleep(30);
+    f.say(2, 'assistant', '嗯');
+    await ask(f, turns, 3, '二');
+    assert.equal(typeof chatCalls(f).pop().body.messages[0].content, 'object');
   });
 });
 
@@ -152,6 +164,21 @@ test('上游拦内容：拿掉最私密的那份再试一次，别的记忆还�
   });
 });
 
+test('被拦过的记忆包记住：下一轮直接用去掉的版本，不再先挨一次拒；记忆包换了再试全的', async () => {
+  await setup(async (f, turns) => {
+    f.relayQueue.push({ status: 503, message: '内容违规已被上游拒绝' });
+    await ask(f, turns, 1, '一');
+    await ask(f, turns, 3, '二');
+    const calls = chatCalls(f);
+    assert.equal(calls.length, 3);
+    assert.doesNotMatch(systemText(calls[2]), /很私密的话/);
+    assert.equal(systemText(calls[1]), systemText(calls[2]));
+    f.pack = PACK + '新的一天\n';
+    await ask(f, turns, 5, '三');
+    assert.match(systemText(chatCalls(f).pop()), /很私密的话/);
+  });
+});
+
 test('验收：聊满 100 条后提第 5 条的梗，原文还在上文里', async () => {
   await setup(async (f, turns) => {
     for (let n = 1; n <= 100; n++) f.say(n, n % 2 ? 'user' : 'assistant', n === 5 ? '第5条的梗：香菜星人' : `话${n}`);
@@ -173,8 +200,19 @@ test('验收：聊到压缩线以后，梗从原文进了会话摘要，放在�
   });
 });
 
+test('切换前的话压进摘要也算这次会话：切过来第一批压掉的不会两头都没有', async () => {
+  await setup(async (f, turns, db) => {
+    f.brain.switched_at = new Date(Date.now() - 1000).toISOString(); // 这些话都在切换之前
+    for (let n = 1; n <= 130; n++) f.say(n, n % 2 ? 'user' : 'assistant', n === 5 ? '第5条的梗：香菜星人' : `话${n}`);
+    await ask(f, turns, 131, '一');
+    await waitFor(() => db.memories?.length === 1);
+    await ask(f, turns, 133, '还记得吗');
+    assert.match(chatCalls(f).pop().body.messages[1].content, /摘要：香菜星人的梗/);
+  });
+});
+
 test('不叠压：满 3 层从原始聊天重新生成，旧的几层作废', async () => {
-  const old = (i) => ({ summary: `旧层${i}`, session_id: 'cc', created_at: new Date().toISOString(), metadata: { upto_time: new Date(Date.parse('2026-11-02T00:00:00Z') + i * 60000).toISOString() } });
+  const old = (i) => ({ summary: `旧层${i}`, session_id: 'cc', created_at: new Date(Date.now() - (9 - i) * 1000).toISOString(), metadata: { from_time: '2026-11-02T00:00:30.000Z', upto_time: new Date(Date.parse('2026-11-02T00:00:00Z') + i * 60000).toISOString() } });
   await setup(async (f, turns, db) => {
     for (let n = 1; n <= 130; n++) f.say(n, n % 2 ? 'user' : 'assistant', n === 5 ? '第5条的梗：香菜星人' : `话${n}`);
     await ask(f, turns, 131, '一');
@@ -211,7 +249,7 @@ test('每日摘要：压完写回 bridge；失败留着下次再试，没 key �
   const posts = [];
   let date = '2026-11-05';
   const bridgeFetch = async (p, o) => {
-    if (p === '/days/pending') return { ok: true, data: date ? { date, open: [], today: {}, transcript: '[t] 她：牙疼' } : { date: null } };
+    if (p.startsWith('/days/pending')) return { ok: true, data: date ? { date, open: [], today: {}, transcript: '[t] 她：牙疼' } : { date: null } };
     posts.push(o.body);
     date = null;
     return { ok: true };
@@ -240,78 +278,6 @@ test('每日摘要：压完写回 bridge；失败留着下次再试，没 key �
   }
 });
 
-test('作废的回复不发给模型，也不算回过：同一条能再答一次', async () => {
-  await setup(async (f, turns) => {
-    f.say(1, 'user', '明天几点');
-    const old = f.say(2, 'assistant', '旧回复十点');
-    old.reply_to = 'm1';
-    old.superseded = true;
-    turns.enqueue('m1');
-    await waitFor(() => f.replies.length === 1);
-    assert.doesNotMatch(allText(chatCalls(f)[0]), /旧回复十点/);
-    assert.equal(f.replies[0].reply_to, 'm1');
-  });
-});
-
-test('她改了更早的话：说明附在她这轮最前，只在这一轮；回上来带 ack', async () => {
-  await setup(async (f, turns) => {
-    f.ctx = { ...f.ctx, edit_notes: [{ id: 'm1', line: '她把 11-02 08:00 时的消息从「旧」改成了「新」' }] };
-    await ask(f, turns, 1, '一');
-    const call = chatCalls(f)[0];
-    assert.match(call.body.messages[call.body.messages.length - 1].content, /^\[系统说明，不是她这次说的：她把 11-02 08:00 时的消息从「旧」改成了「新」\]\n/);
-    assert.deepEqual(f.replies[0].edit_notes_ack, ['m1']);
-    f.ctx = { ...f.ctx, edit_notes: [] }; // bridge 收到 ack 就清了
-    await ask(f, turns, 3, '二');
-    assert.doesNotMatch(allText(chatCalls(f)[1]), /系统说明/);
-    assert.equal(f.replies[1].edit_notes_ack, undefined);
-  });
-});
-
-test('这一轮失败了：不 ack，说明下一轮还在', async () => {
-  await setup(async (f, turns) => {
-    f.ctx = { ...f.ctx, edit_notes: [{ id: 'm1', line: 'x' }] };
-    f.relayQueue.push({ status: 500, message: 'boom' });
-    turns.enqueue(f.say(1, 'user', '一').id);
-    await waitFor(() => f.relay.length >= 1);
-    await sleep(30);
-    assert.equal(f.replies.length, 0);
-  });
-});
-
-test('防抖：打字期间不触发，停下再等够，20 秒上限（这里按比例缩小）', async () => {
-  await setup(async (f, turns) => {
-    turns.enqueue(f.say(1, 'user', '一').id);
-    const start = Date.now();
-    const typing = setInterval(() => turns.composing(true), 20);
-    await sleep(150);
-    assert.equal(chatCalls(f).length, 0); // 过了 debounce，她还在打
-    clearInterval(typing);
-    await waitFor(() => chatCalls(f).length === 1);
-    assert.ok(Date.now() - start >= 150 + 40, '停下以后还要等一个 debounce');
-
-    const t2 = Date.now();
-    const forever = setInterval(() => turns.composing(true), 20);
-    turns.enqueue(f.say(3, 'user', '二').id);
-    await waitFor(() => chatCalls(f).length === 2);
-    clearInterval(forever);
-    const waited = Date.now() - t2;
-    assert.ok(waited >= 380 && waited < 700, `一直打字也到上限就回：${waited}`);
-  }, { env: { API_TURN_DEBOUNCE_MS: '60', API_TURN_MAX_WAIT_MS: '400' } });
-});
-
-test('防抖：清空输入框马上按发消息算；没有待回的消息时打字什么都不做', async () => {
-  await setup(async (f, turns) => {
-    turns.composing(true);
-    await sleep(100);
-    assert.equal(chatCalls(f).length, 0);
-    turns.enqueue(f.say(1, 'user', '一').id);
-    turns.composing(true);
-    await sleep(20);
-    turns.composing(false);
-    await waitFor(() => chatCalls(f).length === 1);
-  }, { env: { API_TURN_DEBOUNCE_MS: '60' } });
-});
-
 test('缓存探测：同一份记忆包发两次，读得出 Anthropic 和 OpenAI 两种 usage', async () => {
   await setup(async (f, turns) => {
     f.usageQueue = [{ prompt_tokens: 100, cache_creation_input_tokens: 90 }, { prompt_tokens: 100, cache_read_input_tokens: 90 }];
@@ -326,4 +292,29 @@ test('缓存探测：同一份记忆包发两次，读得出 Anthropic 和 OpenA
     f.usageQueue = [{ prompt_tokens: 100 }, { prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 80 } }];
     assert.equal((await turns.cacheProbe()).cached, true);
   }, { env: { API_CACHE_PROBE_WAIT_MS: '0' } });
+});
+
+test('每日摘要：同一天失败 3 次就跳过，后面的日子照样压', async () => {
+  const urls = [];
+  const posted = [];
+  const bridgeFetch = async (p, o) => {
+    if (p.startsWith('/days/pending')) {
+      urls.push(p);
+      return { ok: true, data: { date: p.includes('skip=2026-11-01') ? (posted.length ? null : '2026-11-02') : '2026-11-01', open: [], transcript: 'x' } };
+    }
+    posted.push(o.body.date);
+    return { ok: true };
+  };
+  const realFetch = global.fetch;
+  global.fetch = async (u, o) => (JSON.parse(o.body).messages[1].content.includes('2026-11-01')
+    ? { ok: false, status: 500, json: async () => ({}) }
+    : { ok: true, json: async () => ({ choices: [{ message: { content: '{}' } }] }) });
+  try {
+    const days = makeCcDays({ bridgeFetch, env: { DEEPSEEK_API_KEY: 'k' }, log: { error() {}, log() {} } });
+    for (let i = 0; i < 4; i++) await days.kick();
+    assert.deepEqual(posted, ['2026-11-02']);
+    assert.ok(urls.at(-1).includes('skip=2026-11-01'));
+  } finally {
+    global.fetch = realFetch;
+  }
 });

@@ -1393,21 +1393,7 @@ app.post('/api/cc/edit', requireAppKey, (req, res) => {
   if (!isCcId(id)) return res.status(400).json({ error: 'id required' });
   if (typeof text !== 'string' || !text.trim()) return res.status(400).json({ error: 'text required' });
   if (text.length > CC_EDIT_MAX) return res.status(400).json({ error: `text too long (max ${CC_EDIT_MAX})` });
-  // API 在接、改的是最后一条：bridge 把旧回复作废了，这边重答
-  return forwardCcPost(res, '/edit', { id, text: text.trim() }, (data) => { if (data?.regenerate) apiTurns.enqueue(id); });
-});
-
-// 长按他最后一条"重新生成"：旧回复作废，接着回她那条
-app.post('/api/cc/regenerate', requireAppKey, (req, res) => {
-  const id = req.body?.id;
-  if (typeof id !== 'string' || !id || id.length > 128) return res.status(400).json({ error: 'id required' });
-  return forwardCcPost(res, '/regenerate', { id }, (data) => { if (data?.reply_to) apiTurns.enqueue(data.reply_to); });
-});
-
-// 她正在打字：等她打完再回（lib/apiTurn.js 的 schedule）
-app.post('/api/cc/composing', requireAppKey, (req, res) => {
-  apiTurns.composing(req.body?.on === true);
-  res.json({ ok: true });
+  return forwardCcPost(res, '/edit', { id, text: text.trim() });
 });
 
 // 看中转缓不缓存：同一份记忆包发两次，回两次的 usage。花钱，手动跑
