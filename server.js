@@ -8,6 +8,7 @@ const { fetchFileTypes, checkFile } = require('./lib/ccFiles');
 const { findOption, publicCatalog, keyEnvName } = require('./lib/apiModels');
 const { makeApiTurns } = require('./lib/apiTurn');
 const { makeCcOcr } = require('./lib/ccOcr');
+const { makeCcDays } = require('./lib/ccDays');
 const crypto = require('node:crypto');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
@@ -1279,6 +1280,31 @@ const apiTurns = makeApiTurns({ bridgeConfig, supabase, voiceRule: VOICE_RULE, f
 // 她发的图交给 deepseek-flash 认字，写回 bridge 供查找聊天记录（lib/ccOcr.js）
 const ccOcr = makeCcOcr({ bridgeFetch: apiTurns.bridgeFetch });
 if (bridgeConfig()) ccOcr.start();
+// 每日摘要：DeepSeek 把当天聊天压成固定几栏（lib/ccDays.js）
+const ccDays = makeCcDays({ bridgeFetch: apiTurns.bridgeFetch });
+if (bridgeConfig()) ccDays.start();
+
+// bridge 叫的：04:30 原文存好了，来压
+app.post('/api/cc/days/kick', requireBridgeKey, (req, res) => {
+  ccDays.kick();
+  res.status(202).json({ ok: true });
+});
+
+// bridge 叫的：CC 断了切到 API，或者闹钟到点。这几条谁也没回，API 接着回
+app.post('/api/cc/takeover', requireBridgeKey, (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter((id) => typeof id === 'string').slice(0, 20) : [];
+  ids.forEach((id) => apiTurns.enqueue(id));
+  res.json({ ok: true, count: ids.length });
+});
+
+// bridge 拼记忆包用：沐最近几天公开的日记。封存的这里就不给
+app.get('/api/mu/diary/recent', requireBridgeKey, async (req, res) => {
+  const days = Math.min(Math.max(Number(req.query.days) || 3, 1), 14);
+  const { data, error } = await supabase.from('diaries').select('content, diary_date, visibility')
+    .eq('author', 'mu').eq('visibility', 'public').order('diary_date', { ascending: false }).limit(days + 1);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ diaries: data || [] });
+});
 
 // 图片 + 文件一次最多几个看白名单里的 max_items；白名单拉不到时按 9 算（bridge 那边还会再卡一次）
 const CC_MAX_ITEMS_FALLBACK = 9;
@@ -1368,6 +1394,15 @@ app.post('/api/cc/edit', requireAppKey, (req, res) => {
   if (typeof text !== 'string' || !text.trim()) return res.status(400).json({ error: 'text required' });
   if (text.length > CC_EDIT_MAX) return res.status(400).json({ error: `text too long (max ${CC_EDIT_MAX})` });
   return forwardCcPost(res, '/edit', { id, text: text.trim() });
+});
+
+// 看中转缓不缓存：同一份记忆包发两次，回两次的 usage。花钱，手动跑
+app.post('/api/cc/cache-probe', requireBridgeKey, async (req, res) => {
+  try {
+    res.json(await apiTurns.cacheProbe());
+  } catch (err) {
+    res.status(502).json({ error: String(err?.message || err).slice(0, 300) });
+  }
 });
 
 // 沐那一轮没回上来：把她那条再交给沐一次（不新增她的消息）
